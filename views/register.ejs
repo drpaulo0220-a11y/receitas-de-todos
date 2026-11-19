@@ -5,15 +5,16 @@
   <form method="POST" action="/register" class="form-grid">
     <label>
       Nome completo
-      <input type="text" name="name" required />
+      <input type="text" name="name" value="<%= formData ? formData.name : '' %>" autocomplete="name" maxlength="80" required />
     </label>
     <label>
       E-mail
-      <input type="email" name="email" required />
+      <input type="email" name="email" value="<%= formData ? formData.email : '' %>" autocomplete="email" maxlength="254" required />
     </label>
     <label>
       Senha
-      <input type="password" name="password" required minlength="10" autocomplete="new-password" />
+      <input type="password" name="password" required minlength="7" maxlength="72" autocomplete="new-password" aria-describedby="password-hint" />
+      <small id="password-hint">Use de 7 a 72 bytes. A senha não será exibida novamente se algum dado precisar ser corrigido.</small>
     </label>
     <button type="submit" class="button">Cadastrar</button>
     <p>Já tem uma conta? <a href="/login">Entrar</a></p>

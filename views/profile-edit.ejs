@@ -29,7 +29,7 @@
 
     <label>
       URL de uma foto (opcional)
-      <input type="url" name="avatar_url" value="<%= userData.avatar_url && !userData.avatar_url.startsWith('/uploads/') ? userData.avatar_url : '' %>" placeholder="https://..." data-image-url />
+      <input type="url" name="avatar_url" value="<%= userData.avatar_url && !userData.avatar_url.startsWith('/uploads/') && !userData.avatar_url.startsWith('/images/') ? userData.avatar_url : '' %>" placeholder="https://..." data-image-url />
     </label>
 
     <div class="inline-actions">

@@ -23,6 +23,16 @@
       </label>
     </div>
 
+    <label>
+      Estado ou Distrito Federal
+      <select name="state">
+        <option value="">Todos</option>
+        <% states.forEach(([code, name]) => { %>
+          <option value="<%= code %>" <%= state === code ? 'selected' : '' %>><%= name %></option>
+        <% }) %>
+      </select>
+    </label>
+
     <div class="form-row">
       <label>
         Dificuldade
@@ -70,10 +80,12 @@
     <% } else { %>
       <% recipes.forEach((recipe) => { %>
         <article class="recipe-card">
-          <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+          <div class="recipe-thumb"><img class="recipe-thumb-image" src="<%= recipe.photo_url || '/images/default-recipe.svg' %>" alt="Foto de <%= recipe.title %>" loading="lazy" /></div>
+          <%- include('partials/photo-credit', { recipe }) %>
           <div class="recipe-content">
             <div class="meta-row">
               <span class="tag"><%= recipe.category %></span>
+              <% if (recipe.state) { %><span class="tag"><%= states.find(([code]) => code === recipe.state)?.[1] || recipe.state %></span><% } %>
               <span>⭐ <%= Number(recipe.average_rating || 0).toFixed(1) %></span>
             </div>
             <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
@@ -87,6 +99,19 @@
       <% }) %>
     <% } %>
   </div>
+  <% if (page > 1 || hasNextPage) { %>
+    <nav class="pagination" aria-label="Paginação das receitas">
+      <% if (page > 1) { %>
+        <a class="button-secondary" href="/recipes?<%= filterQuery %>&amp;page=<%= page - 1 %>" rel="prev">← Página anterior</a>
+      <% } else { %>
+        <span></span>
+      <% } %>
+      <span class="pagination-current">Página <%= page %></span>
+      <% if (hasNextPage) { %>
+        <a class="button" href="/recipes?<%= filterQuery %>&amp;page=<%= page + 1 %>" rel="next">Próxima página →</a>
+      <% } %>
+    </nav>
+  <% } %>
 </section>
 
 <%- include('partials/footer') %>

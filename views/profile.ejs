@@ -40,7 +40,8 @@
         <div class="recipes-grid grid">
           <% recipes.forEach((recipe) => { %>
             <article class="recipe-card">
-              <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+              <div class="recipe-thumb"><img class="recipe-thumb-image" src="<%= recipe.photo_url || '/images/default-recipe.svg' %>" alt="Foto de <%= recipe.title %>" loading="lazy" /></div>
+              <%- include('partials/photo-credit', { recipe }) %>
               <div class="recipe-content">
                 <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
                 <div class="meta-row">
@@ -63,7 +64,8 @@
           <div class="recipes-grid grid">
             <% favorites.forEach((recipe) => { %>
               <article class="recipe-card">
-                <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+                <div class="recipe-thumb"><img class="recipe-thumb-image" src="<%= recipe.photo_url || '/images/default-recipe.svg' %>" alt="Foto de <%= recipe.title %>" loading="lazy" /></div>
+                <%- include('partials/photo-credit', { recipe }) %>
                 <div class="recipe-content">
                   <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
                   <div class="meta-row">

@@ -52,6 +52,7 @@
         <% recipes.forEach((recipe) => { %>
           <article class="admin-recipe-row">
             <img src="<%= recipe.photo_url || '/images/default-recipe.svg' %>" alt="" loading="lazy" />
+            <%- include('partials/photo-credit', { recipe }) %>
             <div class="admin-recipe-info">
               <a href="/recipe/<%= recipe.id %>"><strong><%= recipe.title %></strong></a>
               <span><%= recipe.category %> · por <%= recipe.author_name %> · <%= formatDate(recipe.created_at) %></span>

@@ -1,0 +1,11 @@
+<% if (recipe.photo_source_url) { %>
+  <small class="photo-credit">
+    <% if (recipe.photo_illustrative) { %>Foto ilustrativa · <% } %>
+    <a href="<%= recipe.photo_source_url %>" target="_blank" rel="noopener noreferrer">Foto: <%= recipe.photo_credit || 'autor informado na fonte' %></a>
+    <% if (photoLicenseUrl(recipe.photo_license)) { %>
+      · <a href="<%= photoLicenseUrl(recipe.photo_license) %>" target="_blank" rel="noopener noreferrer"><%= recipe.photo_license %></a>
+    <% } else { %>
+      · <%= recipe.photo_license || 'licença na fonte' %>
+    <% } %>
+  </small>
+<% } %>

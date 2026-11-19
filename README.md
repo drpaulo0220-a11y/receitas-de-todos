@@ -25,18 +25,15 @@ npm install
 npm start
 ```
 
-Acesse: http://localhost:3000
+Acesse: http://127.0.0.1:3000
 
 ## Testes
 
 Execute `npm test` para verificar a sintaxe do app e rodar os testes integrados de cadastro, receitas, upload, comentários, moderação e persistência de sessão.
 
-## Usuário administrador padrão
+## Conta administradora local
 
-- E-mail: admin@receitasdetodos.com
-- Senha: admin123
-- Acesse `/admin` após entrar para moderar denúncias e excluir qualquer receita.
-- Essa conta padrão é apenas para desenvolvimento local. Em produção, use `ADMIN_EMAIL` e `ADMIN_PASSWORD`.
+Na primeira inicialização, o servidor cria a conta `admin@receitasdetodos.com` com uma senha aleatória e mostra essa senha no terminal. Guarde-a. Para definir uma senha própria, configure `ADMIN_PASSWORD`; esse valor atualiza a senha do administrador a cada inicialização. Em produção, configure também `ADMIN_EMAIL`, `SESSION_SECRET`, `DATA_DIR` e `UPLOAD_DIR`.
 
 ## Funcionalidades implementadas
 
@@ -76,7 +73,7 @@ DATA_DIR=<caminho do volume persistente para o SQLite>
 UPLOAD_DIR=<caminho do volume persistente para as imagens>
 ```
 
-`SESSION_SECRET` deve ter ao menos 32 caracteres e `ADMIN_PASSWORD` ao menos 12. O comando de inicialização é `npm start`. Em produção, `DATA_DIR` e `UPLOAD_DIR` são obrigatórios: aponte ambos para armazenamento persistente do provedor. Um exemplo de montagem é `DATA_DIR=/var/data` e `UPLOAD_DIR=/var/data/uploads`. Serviços com disco temporário podem apagar banco e imagens após reinicializações; não publique com armazenamento efêmero.
+`SESSION_SECRET` deve ter ao menos 32 caracteres e `ADMIN_PASSWORD` entre 12 e 72 bytes. O comando de inicialização é `npm start`. Em desenvolvimento, o servidor escuta apenas em `127.0.0.1`; para expor na rede, configure `HOST`, `SESSION_SECRET` forte e `ADMIN_PASSWORD` forte. Em produção, `DATA_DIR` e `UPLOAD_DIR` são obrigatórios: aponte ambos para armazenamento persistente do provedor. Um exemplo de montagem é `DATA_DIR=/var/data` e `UPLOAD_DIR=/var/data/uploads`. Serviços com disco temporário podem apagar banco e imagens após reinicializações; não publique com armazenamento efêmero.
 
 Para habilitar recuperação por e-mail, configure também:
 

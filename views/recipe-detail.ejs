@@ -7,7 +7,8 @@
 
 <section class="recipe-detail stack">
   <div>
-    <div class="detail-cover" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+    <img class="detail-cover" src="<%= recipe.photo_url || '/images/default-recipe.svg' %>" alt="Foto de <%= recipe.title %>" fetchpriority="high" />
+    <%- include('partials/photo-credit', { recipe }) %>
 
     <div class="sidebar-card" style="margin-top: 20px;">
       <div class="meta-row">
@@ -15,6 +16,10 @@
         <span>⭐ <%= Number(recipe.average_rating || 0).toFixed(1) %> (<%= recipe.ratings_count || 0 %>)</span>
       </div>
       <p><%= recipe.description %></p>
+
+      <% if (recipe.state) { %>
+        <p><a class="button-secondary" href="https://www.pinterest.com/search/pins/?q=<%= encodeURIComponent(recipe.title.replace(/\s*\([A-Z]{2}\)\s*$/, '')) %>" target="_blank" rel="noopener noreferrer">Buscar esta receita no Pinterest</a></p>
+      <% } %>
 
       <div class="inline-actions">
         <button type="button" class="button-secondary" data-share-recipe data-share-title="<%= recipe.title %>">Compartilhar</button>
@@ -44,6 +49,7 @@
     <div class="sidebar-card">
       <h3>Detalhes</h3>
       <div class="meta-row"><strong>Autor:</strong> <a href="/profile/<%= recipe.user_id %>"><%= recipe.author_name %></a></div>
+      <% if (recipe.state) { %><div class="meta-row"><strong>Origem:</strong> <span><%= states.find(([code]) => code === recipe.state)?.[1] || recipe.state %></span></div><% } %>
       <div class="meta-row"><strong>Tempo:</strong> <span><%= recipe.prep_time %></span></div>
       <div class="meta-row"><strong>Rendimento:</strong> <span><%= recipe.servings %></span></div>
       <div class="meta-row"><strong>Dificuldade:</strong> <span><%= recipe.difficulty %></span></div>
@@ -110,6 +116,7 @@
 <section class="section">
   <div class="panel">
     <h2>Comentários</h2>
+    <p>São exibidas até 20 respostas mais recentes por comentário.</p>
     <% if (currentUser) { %>
       <form method="POST" action="/recipe/<%= recipe.id %>/comment" class="form-grid" style="margin-bottom: 18px;">
         <textarea name="body" maxlength="1000" required placeholder="Deixe uma dica ou comentário..."></textarea>
@@ -175,6 +182,17 @@
         <% }) %>
       <% } %>
     </div>
+    <% if (commentPageCount > 1) { %>
+      <nav class="pagination" aria-label="Paginação dos comentários">
+        <% if (hasNewerComments) { %>
+          <a class="button-secondary" href="/recipe/<%= recipe.id %>?comments_page=<%= commentPage - 1 %>" rel="prev">Comentários mais recentes</a>
+        <% } else { %><span></span><% } %>
+        <span class="pagination-current">Página <%= commentPage %> de <%= commentPageCount %></span>
+        <% if (hasOlderComments) { %>
+          <a class="button" href="/recipe/<%= recipe.id %>?comments_page=<%= commentPage + 1 %>" rel="next">Comentários anteriores</a>
+        <% } %>
+      </nav>
+    <% } %>
   </div>
 </section>
 

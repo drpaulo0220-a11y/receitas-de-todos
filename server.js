@@ -9,11 +9,19 @@ const nodemailer = require('nodemailer');
 const Database = require('better-sqlite3');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
+const HOST = process.env.HOST || (isProduction ? '0.0.0.0' : '127.0.0.1');
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'public', 'uploads'));
 const dbPath = path.join(dataDir, 'recipes.db');
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT deve ser um nÃºmero entre 1 e 65535.');
+if (!isProduction && !LOOPBACK_HOSTS.has(HOST) &&
+    (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32 ||
+     !process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD.length < 12)) {
+  throw new Error('Para expor o modo de desenvolvimento na rede, configure HOST, SESSION_SECRET (32+ caracteres) e ADMIN_PASSWORD (12+ caracteres).');
+}
 const IMAGE_TYPES = {
   'image/jpeg': { extension: '.jpg', signature: (header) => header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff },
   'image/png': { extension: '.png', signature: (header) => header.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
@@ -29,6 +37,9 @@ if (isProduction && (!process.env.SESSION_SECRET || !process.env.ADMIN_EMAIL || 
 }
 if (isProduction && (process.env.SESSION_SECRET.length < 32 || process.env.ADMIN_PASSWORD.length < 12)) {
   throw new Error('Em produção, SESSION_SECRET deve ter pelo menos 32 caracteres e ADMIN_PASSWORD pelo menos 12.');
+}
+if (process.env.ADMIN_PASSWORD && Buffer.byteLength(process.env.ADMIN_PASSWORD, 'utf8') > 72) {
+  throw new Error('ADMIN_PASSWORD deve ter no mÃ¡ximo 72 bytes para ser compatÃ­vel com bcrypt.');
 }
 
 const smtpHost = process.env.SMTP_HOST;
@@ -63,6 +74,8 @@ const mailer = smtpHost
   : null;
 
 const db = new Database(dbPath);
+db.pragma('foreign_keys = ON');
+db.pragma('busy_timeout = 5000');
 const storage = multer.diskStorage({
   destination: function (_req, _file, cb) {
     cb(null, uploadDir);
@@ -171,6 +184,26 @@ class SqliteSessionStore extends session.Store {
 }
 
 const CATEGORIES = ['bolos', 'sobremesas', 'carnes', 'massas', 'bebidas', 'lanches', 'saladas', 'regionais'];
+const BRAZIL_STATES = [
+  ['AC', 'Acre'], ['AL', 'Alagoas'], ['AP', 'Amapá'], ['AM', 'Amazonas'], ['BA', 'Bahia'],
+  ['CE', 'Ceará'], ['DF', 'Distrito Federal'], ['ES', 'Espírito Santo'], ['GO', 'Goiás'],
+  ['MA', 'Maranhão'], ['MT', 'Mato Grosso'], ['MS', 'Mato Grosso do Sul'], ['MG', 'Minas Gerais'],
+  ['PA', 'Pará'], ['PB', 'Paraíba'], ['PR', 'Paraná'], ['PE', 'Pernambuco'], ['PI', 'Piauí'],
+  ['RJ', 'Rio de Janeiro'], ['RN', 'Rio Grande do Norte'], ['RS', 'Rio Grande do Sul'],
+  ['RO', 'Rondônia'], ['RR', 'Roraima'], ['SC', 'Santa Catarina'], ['SP', 'São Paulo'],
+  ['SE', 'Sergipe'], ['TO', 'Tocantins']
+];
+const BRAZIL_STATE_CODES = new Set(BRAZIL_STATES.map(([code]) => code));
+
+function getPhotoLicenseUrl(license = '') {
+  const normalized = license.trim();
+  const ccBySa = normalized.match(/^CC BY-SA\s+([\d.]+)$/i);
+  if (ccBySa) return `https://creativecommons.org/licenses/by-sa/${ccBySa[1]}/`;
+  const ccBy = normalized.match(/^CC BY\s+([\d.]+)$/i);
+  if (ccBy) return `https://creativecommons.org/licenses/by/${ccBy[1]}/`;
+  if (/^CC0/i.test(normalized)) return 'https://creativecommons.org/publicdomain/zero/1.0/';
+  return '';
+}
 
 function safeJsonArray(value) {
   try {
@@ -191,7 +224,7 @@ function setFlash(req, message, type = 'info') {
 }
 
 function parseLines(value) {
-  return (value || '')
+  return (typeof value === 'string' ? value : '')
     .split(/\n|\r\n/)
     .map((item) => item.trim())
     .filter(Boolean);
@@ -202,30 +235,74 @@ function getPrepTimeMinutes(value) {
   return match ? Number(match[1]) : 0;
 }
 
+function createRateLimiter({ windowMs, max, message }) {
+  const buckets = new Map();
+  const cleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, bucket] of buckets) {
+      if (bucket.resetAt <= now) buckets.delete(key);
+    }
+  }, Math.min(windowMs, 60 * 1000));
+  cleanupTimer.unref();
+
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip || req.socket.remoteAddress || 'unknown';
+    let bucket = buckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      buckets.set(key, bucket);
+    }
+    if (bucket.count >= max) {
+      const retryAfter = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfter));
+      res.setHeader('RateLimit-Limit', String(max));
+      res.setHeader('RateLimit-Remaining', '0');
+      res.setHeader('RateLimit-Reset', String(retryAfter));
+      return res.status(429).type('text/plain').send(message);
+    }
+    bucket.count += 1;
+    res.setHeader('RateLimit-Limit', String(max));
+    res.setHeader('RateLimit-Remaining', String(max - bucket.count));
+    next();
+  };
+}
+
+const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, message: 'Muitas tentativas de login. Aguarde 15 minutos e tente novamente.' });
+const registrationLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 10, message: 'Muitas tentativas de cadastro. Aguarde uma hora e tente novamente.' });
+const recoveryLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 5, message: 'Muitos pedidos de recuperação. Aguarde uma hora e tente novamente.' });
+const resetLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, message: 'Muitas tentativas para redefinir a senha. Aguarde 15 minutos.' });
+const uploadLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, message: 'Limite de uploads atingido. Tente novamente daqui a uma hora.' });
+const writeLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 120, message: 'Muitas ações em pouco tempo. Aguarde 15 minutos.' });
+
 function isSafeImageUrl(value) {
   if (!value) return true;
   try {
     const url = new URL(value);
-    return url.protocol === 'https:' || url.protocol === 'http:';
+    return url.protocol === 'https:';
   } catch (_error) {
     return false;
   }
 }
 
 function parseRecipeForm(body) {
-  const title = (body.title || '').trim();
-  const description = (body.description || '').trim();
-  const category = (body.category || '').trim();
+  body = body && typeof body === 'object' ? body : {};
+  const asText = (value) => typeof value === 'string' ? value : '';
+  const title = asText(body.title).trim();
+  const description = asText(body.description).trim();
+  const category = asText(body.category).trim();
+  const state = typeof body.state === 'string' ? body.state.trim().toUpperCase() : '';
   const prepMinutes = Number(body.prep_time);
-  const servings = (body.servings || '').trim();
-  const difficulty = (body.difficulty || '').trim();
+  const servings = asText(body.servings).trim();
+  const difficulty = asText(body.difficulty).trim();
   const ingredients = parseLines(body.ingredients);
   const steps = parseLines(body.steps);
-  const photoUrl = (body.photo_url || '').trim();
+  const photoUrl = asText(body.photo_url).trim();
 
   if (title.length < 2 || title.length > 120 ||
       description.length < 10 || description.length > 3000 ||
       !CATEGORIES.includes(category) ||
+      (state && !BRAZIL_STATE_CODES.has(state)) ||
       !Number.isInteger(prepMinutes) || prepMinutes < 1 || prepMinutes > 1440 ||
       !servings || servings.length > 80 ||
       !['fácil', 'média', 'difícil'].includes(difficulty) ||
@@ -242,6 +319,7 @@ function parseRecipeForm(body) {
       title,
       description,
       category,
+      state,
       prepTime: `${prepMinutes} minutos`,
       servings,
       difficulty,
@@ -253,7 +331,7 @@ function parseRecipeForm(body) {
 }
 
 function getRecipeSummary(params = {}) {
-  const { search = '', category = '', difficulty = '', maxPrepTime = 0, sort = 'newest', limit = 12 } = params;
+  const { search = '', category = '', state = '', difficulty = '', maxPrepTime = 0, sort = 'newest', limit = 12, offset = 0 } = params;
   const clauses = ['1 = 1'];
   const values = [];
 
@@ -271,6 +349,11 @@ function getRecipeSummary(params = {}) {
   if (category) {
     clauses.push('r.category = ?');
     values.push(category);
+  }
+
+  if (state) {
+    clauses.push('r.state = ?');
+    values.push(state);
   }
 
   if (difficulty) {
@@ -301,10 +384,10 @@ function getRecipeSummary(params = {}) {
     JOIN users u ON u.id = r.user_id
     WHERE ${clauses.join(' AND ')}
     ORDER BY ${orderBy}
-    LIMIT ?
+    LIMIT ? OFFSET ?
   `;
 
-  return db.prepare(sql).all(...values, limit);
+  return db.prepare(sql).all(...values, limit, offset);
 }
 
 function getRecipeDetail(id) {
@@ -326,6 +409,14 @@ function getRecipeDetail(id) {
   `).get(id);
 }
 
+function removeUploadedFile(photoUrl) {
+  if (typeof photoUrl !== 'string' || !photoUrl.startsWith('/uploads/')) return;
+  const filename = photoUrl.slice('/uploads/'.length);
+  if (!filename || filename !== path.basename(filename)) return;
+  const imagePath = path.resolve(uploadDir, filename);
+  if (path.dirname(imagePath) === uploadDir && fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
+}
+
 function removeRecipe(recipeId) {
   const recipe = db.prepare('SELECT id, photo_url FROM recipes WHERE id = ?').get(recipeId);
   if (!recipe) return false;
@@ -340,13 +431,7 @@ function removeRecipe(recipeId) {
     db.prepare('DELETE FROM recipes WHERE id = ?').run(recipeId);
   })();
 
-  if (recipe.photo_url && recipe.photo_url.startsWith('/uploads/')) {
-    const filename = recipe.photo_url.slice('/uploads/'.length);
-    if (filename && filename === path.basename(filename)) {
-      const imagePath = path.join(uploadDir, filename);
-      if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
-    }
-  }
+  removeUploadedFile(recipe.photo_url);
   return true;
 }
 
@@ -380,8 +465,13 @@ function initializeDatabase() {
       user_id INTEGER NOT NULL,
       title TEXT NOT NULL,
       category TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT '',
       description TEXT NOT NULL,
       photo_url TEXT DEFAULT '',
+      photo_credit TEXT NOT NULL DEFAULT '',
+      photo_source_url TEXT NOT NULL DEFAULT '',
+      photo_license TEXT NOT NULL DEFAULT '',
+      photo_illustrative INTEGER NOT NULL DEFAULT 0,
       ingredients_json TEXT NOT NULL,
       steps_json TEXT NOT NULL,
       prep_time TEXT NOT NULL,
@@ -459,7 +549,13 @@ function initializeDatabase() {
       expires INTEGER NOT NULL,
       user_id INTEGER
     );
+    CREATE TABLE IF NOT EXISTS seed_migrations (
+      name TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS web_sessions_expires_idx ON web_sessions(expires);
+    CREATE INDEX IF NOT EXISTS comments_recipe_parent_created_idx ON comments(recipe_id, parent_id, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS comments_parent_created_idx ON comments(parent_id, created_at DESC, id DESC);
   `);
 
   const userColumns = db.prepare('PRAGMA table_info(users)').all();
@@ -470,16 +566,35 @@ function initializeDatabase() {
   if (!sessionColumns.some((column) => column.name === 'user_id')) {
     db.exec('ALTER TABLE web_sessions ADD COLUMN user_id INTEGER');
   }
+  const recipeColumns = db.prepare('PRAGMA table_info(recipes)').all();
+  if (!recipeColumns.some((column) => column.name === 'state')) {
+    db.exec("ALTER TABLE recipes ADD COLUMN state TEXT NOT NULL DEFAULT ''");
+  }
+  const photoColumns = new Set(db.prepare('PRAGMA table_info(recipes)').all().map((column) => column.name));
+  const missingPhotoColumns = [
+    ['photo_credit', "TEXT NOT NULL DEFAULT ''"],
+    ['photo_source_url', "TEXT NOT NULL DEFAULT ''"],
+    ['photo_license', "TEXT NOT NULL DEFAULT ''"],
+    ['photo_illustrative', 'INTEGER NOT NULL DEFAULT 0']
+  ];
+  for (const [column, definition] of missingPhotoColumns) {
+    if (!photoColumns.has(column)) db.exec(`ALTER TABLE recipes ADD COLUMN ${column} ${definition}`);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS recipes_state_idx ON recipes(state)');
 
   const adminEmail = (process.env.ADMIN_EMAIL || 'admin@receitasdetodos.com').trim().toLowerCase();
-  const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
-  const existingAdmin = db.prepare('SELECT id FROM users WHERE email = ?').get(adminEmail);
+  const adminPassword = process.env.ADMIN_PASSWORD || crypto.randomBytes(24).toString('base64url');
+  const existingAdmin = db.prepare('SELECT id, password_hash FROM users WHERE email = ?').get(adminEmail);
   if (!existingAdmin) {
     const adminHash = bcrypt.hashSync(adminPassword, 10);
     const inserted = db.prepare(`
       INSERT INTO users (name, email, password_hash, bio, avatar_url, is_admin)
       VALUES (?, ?, ?, ?, ?, 1)
     `).run('Admin Receitas', adminEmail, adminHash, 'Moderador da comunidade de culinária.', '/images/default-avatar.svg');
+
+    if (!isProduction && !process.env.ADMIN_PASSWORD) {
+      console.warn(`Senha inicial do administrador (guarde-a): ${adminPassword}`);
+    }
 
     const recipesSeed = [
       {
@@ -538,8 +653,108 @@ function initializeDatabase() {
       );
     }
   } else if (process.env.ADMIN_PASSWORD) {
-    const adminHash = bcrypt.hashSync(adminPassword, 10);
-    db.prepare('UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?').run(adminHash, existingAdmin.id);
+    if (!bcrypt.compareSync(adminPassword, existingAdmin.password_hash)) {
+      const adminHash = bcrypt.hashSync(adminPassword, 10);
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(adminHash, existingAdmin.id);
+      db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(existingAdmin.id);
+    }
+    db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(existingAdmin.id);
+  } else if (!isProduction && bcrypt.compareSync('admin123', existingAdmin.password_hash)) {
+    const newAdminPassword = crypto.randomBytes(24).toString('base64url');
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newAdminPassword, 10), existingAdmin.id);
+    db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(existingAdmin.id);
+    console.warn(`A senha administrativa padrÃ£o foi substituÃ­da. Nova senha (guarde-a): ${newAdminPassword}`);
+  }
+
+  const regionalSeedName = 'regional-recipes-810-v1';
+  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(regionalSeedName)) {
+    const regionalRecipes = require('./seed-data/regional-recipes');
+    const seedOwner = db.prepare('SELECT id FROM users WHERE email = ?').get(adminEmail);
+    if (!seedOwner || regionalRecipes.length !== 810) {
+      throw new Error('O catálogo regional precisa conter 810 receitas e uma conta administradora.');
+    }
+    const insertRegionalRecipe = db.prepare(`
+      INSERT INTO recipes (user_id, title, category, state, description, photo_url, photo_credit, photo_source_url, photo_license, photo_illustrative, ingredients_json, steps_json, prep_time, servings, difficulty)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    db.transaction(() => {
+      for (const recipe of regionalRecipes) {
+        insertRegionalRecipe.run(
+          seedOwner.id, recipe.title, recipe.category, recipe.state, recipe.description, recipe.photo_url,
+          recipe.photo_credit, recipe.photo_source_url, recipe.photo_license, recipe.photo_illustrative,
+          JSON.stringify(recipe.ingredients), JSON.stringify(recipe.steps), recipe.prep_time,
+          recipe.servings, recipe.difficulty
+        );
+      }
+      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(regionalSeedName);
+    })();
+  }
+
+  const imageMigrationName = 'regional-recipe-images-v2';
+  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(imageMigrationName)) {
+    const regionalRecipes = require('./seed-data/regional-recipes');
+    const updateRecipeImage = db.prepare(`
+      UPDATE recipes
+      SET photo_url = ?, photo_credit = ?, photo_source_url = ?, photo_license = ?, photo_illustrative = ?
+      WHERE state = ? AND title = ?
+    `);
+    db.transaction(() => {
+      for (const recipe of regionalRecipes) {
+        updateRecipeImage.run(
+          recipe.photo_url, recipe.photo_credit, recipe.photo_source_url, recipe.photo_license,
+          recipe.photo_illustrative, recipe.state, recipe.title
+        );
+      }
+      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(imageMigrationName);
+    })();
+  }
+
+  const verifiedRecipePhotoMigration = 'regional-recipe-photos-clear-v1';
+  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(verifiedRecipePhotoMigration)) {
+    const regionalRecipes = require('./seed-data/regional-recipes');
+    const clearRecipePhoto = db.prepare(`
+      UPDATE recipes
+      SET photo_url = '', photo_credit = '', photo_source_url = '', photo_license = '', photo_illustrative = 0
+      WHERE state = ? AND title = ?
+    `);
+    db.transaction(() => {
+      for (const recipe of regionalRecipes) clearRecipePhoto.run(recipe.state, recipe.title);
+      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(verifiedRecipePhotoMigration);
+    })();
+  }
+
+  const exactRecipePhotoMigration = 'regional-recipe-photos-exact-v1';
+  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(exactRecipePhotoMigration)) {
+    const regionalRecipes = require('./seed-data/regional-recipes');
+    const updateVerifiedRecipePhoto = db.prepare(`
+      UPDATE recipes
+      SET photo_url = ?, photo_credit = ?, photo_source_url = ?, photo_license = ?, photo_illustrative = 0
+      WHERE state = ? AND title = ?
+    `);
+    db.transaction(() => {
+      for (const recipe of regionalRecipes) {
+        updateVerifiedRecipePhoto.run(
+          recipe.photo_url, recipe.photo_credit, recipe.photo_source_url, recipe.photo_license,
+          recipe.state, recipe.title
+        );
+      }
+      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(exactRecipePhotoMigration);
+    })();
+  }
+
+  const regionalRecipeDraftLabelMigration = 'regional-recipe-draft-label-v1';
+  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(regionalRecipeDraftLabelMigration)) {
+    const regionalRecipes = require('./seed-data/regional-recipes');
+    const updateDraftDescription = db.prepare(`
+      UPDATE recipes SET description = ?
+      WHERE state = ? AND title = ? AND description LIKE 'Versão caseira de %'
+    `);
+    db.transaction(() => {
+      for (const recipe of regionalRecipes) {
+        updateDraftDescription.run(recipe.description, recipe.state, recipe.title);
+      }
+      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(regionalRecipeDraftLabelMigration);
+    })();
   }
 
   if (isProduction && adminEmail !== 'admin@receitasdetodos.com') {
@@ -550,8 +765,17 @@ function initializeDatabase() {
 initializeDatabase();
 db.pragma('journal_mode = WAL');
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'");
+  next();
+});
+app.use(express.urlencoded({ extended: true, limit: '64kb', parameterLimit: 200 }));
+app.use(express.json({ limit: '32kb' }));
 app.use('/uploads', express.static(uploadDir, { dotfiles: 'deny', index: false }));
 app.use(express.static(path.join(__dirname, 'public')));
 if (isProduction) app.set('trust proxy', 1);
@@ -561,7 +785,7 @@ const cleanupSessions = setInterval(() => {
 }, 60 * 60 * 1000);
 cleanupSessions.unref();
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'receitas-de-todos-secret',
+  secret: process.env.SESSION_SECRET || crypto.randomBytes(48).toString('hex'),
   store: sessionStore,
   resave: false,
   saveUninitialized: false,
@@ -573,8 +797,24 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
 app.use((req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const source = req.get('origin') || req.get('referer');
+  if (!source) return next();
+  try {
+    const sourceOrigin = new URL(source).origin;
+    const requestOrigin = new URL(`${req.protocol}://${req.get('host')}`).origin;
+    if (sourceOrigin === requestOrigin) return next();
+  } catch (_error) {
+    // Invalid Origin/Referer values are rejected below.
+  }
+  return res.status(403).send('Esta solicitaÃ§Ã£o foi bloqueada por seguranÃ§a.');
+});
+
+app.use((req, res, next) => {
   res.locals.currentUser = req.session.user || null;
   res.locals.categories = CATEGORIES;
+  res.locals.states = BRAZIL_STATES;
+  res.locals.photoLicenseUrl = getPhotoLicenseUrl;
   res.locals.formatDate = formatDate;
   res.locals.prepTimeMinutes = getPrepTimeMinutes;
   res.locals.flash = req.session.flash || null;
@@ -589,12 +829,13 @@ function requireAuth(req, res, next) {
     setFlash(req, 'Faça login para continuar.', 'warning');
     return res.redirect('/login');
   }
-  const user = db.prepare('SELECT is_suspended FROM users WHERE id = ?').get(req.session.user.id);
+  const user = db.prepare('SELECT is_suspended, is_admin FROM users WHERE id = ?').get(req.session.user.id);
   if (!user || user.is_suspended) {
     req.session.user = null;
     setFlash(req, 'Esta conta não está disponível. Se precisar de ajuda, fale com a administração.', 'danger');
     return res.redirect('/login');
   }
+  req.session.user.is_admin = !!user.is_admin;
   next();
 }
 
@@ -608,6 +849,20 @@ function requireAdmin(req, res, next) {
     return res.redirect('/');
   }
   req.session.user.is_admin = true;
+  next();
+}
+
+function requireRecipeEditAccess(req, res, next) {
+  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+  if (!recipe) {
+    setFlash(req, 'Receita nÃ£o encontrada.', 'warning');
+    return res.redirect('/recipes');
+  }
+  if (recipe.user_id !== req.session.user.id && !req.session.user.is_admin) {
+    setFlash(req, 'VocÃª nÃ£o pode editar esta receita.', 'danger');
+    return res.redirect(`/recipe/${recipe.id}`);
+  }
+  req.recipe = recipe;
   next();
 }
 
@@ -630,40 +885,61 @@ function establishSession(req, res, user, message, redirectTo, next) {
   });
 }
 
-function renderHomePage(res, extra = {}) {
-  const recentRecipes = getRecipeSummary({ limit: 6 });
-  const popularRecipes = getRecipeSummary({ sort: 'popular', limit: 6 });
-  const featuredRecipes = getRecipeSummary({ sort: 'rating', limit: 3 });
+function renderHomePage(req, res) {
+  const pageSize = 20;
+  const totalRecipes = db.prepare('SELECT COUNT(*) AS total FROM recipes').get().total;
+  const pageCount = Math.max(1, Math.ceil(totalRecipes / pageSize));
+  const requestedPage = typeof req.query.page === 'string' ? Number(req.query.page) : 1;
+  const page = Number.isSafeInteger(requestedPage) && requestedPage > 0
+    ? Math.min(requestedPage, pageCount)
+    : 1;
+  const recipes = getRecipeSummary({ limit: pageSize, offset: (page - 1) * pageSize });
 
   res.render('home', {
-    recentRecipes,
-    popularRecipes,
-    featuredRecipes,
-    ...extra
+    recipes,
+    page,
+    pageCount,
+    totalRecipes,
+    firstRecipeNumber: totalRecipes ? (page - 1) * pageSize + 1 : 0,
+    lastRecipeNumber: Math.min(page * pageSize, totalRecipes),
+    pageNumbers: Array.from({ length: pageCount }, (_value, index) => index + 1),
+    pageTitle: 'Receitas de Todos'
   });
 }
 
 app.get('/', (req, res) => {
-  renderHomePage(res);
+  renderHomePage(req, res);
 });
 
 app.get('/recipes', (req, res) => {
-  const search = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const search = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
   const category = typeof req.query.category === 'string' ? req.query.category.trim() : '';
+  const requestedState = typeof req.query.state === 'string' ? req.query.state.trim().toUpperCase() : '';
+  const state = BRAZIL_STATE_CODES.has(requestedState) ? requestedState : '';
   const difficulty = typeof req.query.difficulty === 'string' ? req.query.difficulty.trim() : '';
   const requestedMaxTime = typeof req.query.max_time === 'string' ? Number(req.query.max_time) : 0;
   const maxPrepTime = [15, 30, 45, 60, 90, 120].includes(requestedMaxTime) ? requestedMaxTime : 0;
   const sort = typeof req.query.sort === 'string' ? req.query.sort : 'newest';
-  const recipes = getRecipeSummary({ search, category, difficulty, maxPrepTime, sort, limit: 24 });
+  const requestedPage = typeof req.query.page === 'string' ? Number(req.query.page) : 1;
+  const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? Math.min(requestedPage, 10000) : 1;
+  const pageSize = 24;
+  const pageRecipes = getRecipeSummary({ search, category, state, difficulty, maxPrepTime, sort, limit: pageSize + 1, offset: (page - 1) * pageSize });
+  const hasNextPage = pageRecipes.length > pageSize;
+  const recipes = pageRecipes.slice(0, pageSize);
+  const filterQuery = new URLSearchParams({ q: search, category, state, difficulty, max_time: String(maxPrepTime || ''), sort }).toString();
 
   res.render('recipes', {
     recipes,
     search,
     category,
+    state,
     difficulty,
     maxPrepTime,
     sort,
     selectedCategory: category,
+    page,
+    hasNextPage,
+    filterQuery,
     pageTitle: 'Receitas'
   });
 });
@@ -677,19 +953,34 @@ app.get('/recipe/:id', (req, res) => {
 
   const ingredients = safeJsonArray(recipe.ingredients_json);
   const steps = safeJsonArray(recipe.steps_json);
-  const comments = db.prepare(`
+  const commentPageSize = 25;
+  const totalTopLevelComments = db.prepare('SELECT COUNT(*) AS total FROM comments WHERE recipe_id = ? AND parent_id IS NULL').get(recipe.id).total;
+  const requestedCommentPage = typeof req.query.comments_page === 'string' ? Number(req.query.comments_page) : 1;
+  const commentPageCount = Math.max(1, Math.ceil(totalTopLevelComments / commentPageSize));
+  const commentPage = Number.isSafeInteger(requestedCommentPage) && requestedCommentPage > 0
+    ? Math.min(requestedCommentPage, commentPageCount)
+    : 1;
+  const topLevelComments = db.prepare(`
     SELECT c.*, u.name AS author_name, u.avatar_url AS author_avatar
     FROM comments c
     JOIN users u ON u.id = c.user_id
-    WHERE c.recipe_id = ?
-    ORDER BY c.created_at DESC
-  `).all(recipe.id);
-  const topLevelComments = comments
-    .filter((comment) => !comment.parent_id)
-    .map((comment) => ({
-      ...comment,
-      replies: comments.filter((reply) => reply.parent_id === comment.id)
-    }));
+    WHERE c.recipe_id = ? AND c.parent_id IS NULL
+    ORDER BY c.created_at DESC, c.id DESC
+    LIMIT ? OFFSET ?
+  `).all(recipe.id, commentPageSize, (commentPage - 1) * commentPageSize);
+  const getRecentReplies = db.prepare(`
+    SELECT c.*, u.name AS author_name, u.avatar_url AS author_avatar
+    FROM comments c
+    JOIN users u ON u.id = c.user_id
+    WHERE c.parent_id = ?
+    ORDER BY c.created_at DESC, c.id DESC
+    LIMIT 20
+  `);
+  for (const comment of topLevelComments) {
+    comment.replies = getRecentReplies.all(comment.id).reverse();
+  }
+  const hasOlderComments = commentPage < commentPageCount;
+  const hasNewerComments = commentPage > 1;
 
   const hasLiked = req.session.user
     ? db.prepare('SELECT 1 FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
@@ -710,6 +1001,10 @@ app.get('/recipe/:id', (req, res) => {
     ingredients,
     steps,
     comments: topLevelComments,
+    commentPage,
+    commentPageCount,
+    hasOlderComments,
+    hasNewerComments,
     hasLiked,
     hasFavorited,
     userRating: userRating ? userRating.score : 0,
@@ -739,8 +1034,8 @@ app.get('/recipe/:id/edit', requireAuth, (req, res) => {
   });
 });
 
-app.post('/recipe/:id/edit', requireAuth, upload.single('photo'), verifyUploadedImage, (req, res) => {
-  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+app.post('/recipe/:id/edit', requireAuth, requireRecipeEditAccess, writeLimiter, uploadLimiter, upload.single('photo'), verifyUploadedImage, (req, res) => {
+  const recipe = req.recipe;
   if (!recipe) {
     return res.redirect('/recipes');
   }
@@ -761,15 +1056,16 @@ app.post('/recipe/:id/edit', requireAuth, upload.single('photo'), verifyUploaded
 
   db.prepare(`
     UPDATE recipes
-    SET title = ?, category = ?, description = ?, photo_url = ?, ingredients_json = ?, steps_json = ?, prep_time = ?, servings = ?, difficulty = ?
+    SET title = ?, category = ?, state = ?, description = ?, photo_url = ?, ingredients_json = ?, steps_json = ?, prep_time = ?, servings = ?, difficulty = ?
     WHERE id = ?
-  `).run(fields.title, fields.category, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty, recipe.id);
+  `).run(fields.title, fields.category, fields.state, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty, recipe.id);
+  if (recipe.photo_url !== photoUrl) removeUploadedFile(recipe.photo_url);
 
   setFlash(req, 'Receita atualizada com sucesso!', 'success');
   res.redirect(`/recipe/${recipe.id}`);
 });
 
-app.post('/recipe/:id/delete', requireAuth, (req, res) => {
+app.post('/recipe/:id/delete', requireAuth, writeLimiter, (req, res) => {
   const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
   if (!recipe) {
     return res.redirect('/recipes');
@@ -785,7 +1081,7 @@ app.post('/recipe/:id/delete', requireAuth, (req, res) => {
   return res.redirect('/profile');
 });
 
-app.post('/recipe/:id/like', requireAuth, (req, res) => {
+app.post('/recipe/:id/like', requireAuth, writeLimiter, (req, res) => {
   const recipeId = Number(req.params.id);
   const existing = db.prepare('SELECT id FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
 
@@ -798,7 +1094,7 @@ app.post('/recipe/:id/like', requireAuth, (req, res) => {
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/favorite', requireAuth, (req, res) => {
+app.post('/recipe/:id/favorite', requireAuth, writeLimiter, (req, res) => {
   const recipeId = Number(req.params.id);
   const existing = db.prepare('SELECT id FROM favorites WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
 
@@ -811,7 +1107,7 @@ app.post('/recipe/:id/favorite', requireAuth, (req, res) => {
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/rate', requireAuth, (req, res) => {
+app.post('/recipe/:id/rate', requireAuth, writeLimiter, (req, res) => {
   const recipeId = Number(req.params.id);
   const score = Number(req.body.score || 0);
 
@@ -831,7 +1127,7 @@ app.post('/recipe/:id/rate', requireAuth, (req, res) => {
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/comment', requireAuth, (req, res) => {
+app.post('/recipe/:id/comment', requireAuth, writeLimiter, (req, res) => {
   const recipeId = Number(req.params.id);
   const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
   const parentId = req.body.parent_id ? Number(req.body.parent_id) : null;
@@ -859,7 +1155,7 @@ app.post('/recipe/:id/comment', requireAuth, (req, res) => {
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/report', requireAuth, (req, res) => {
+app.post('/recipe/:id/report', requireAuth, writeLimiter, (req, res) => {
   const recipeId = Number(req.params.id);
   const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
 
@@ -878,7 +1174,7 @@ app.post('/recipe/:id/report', requireAuth, (req, res) => {
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/comment/:id/report', requireAuth, (req, res) => {
+app.post('/comment/:id/report', requireAuth, writeLimiter, (req, res) => {
   const commentId = Number(req.params.id);
   const comment = db.prepare('SELECT id, recipe_id FROM comments WHERE id = ?').get(commentId);
   if (!comment) {
@@ -903,12 +1199,13 @@ app.get('/login', (req, res) => {
   res.render('login', { pageTitle: 'Login' });
 });
 
-app.post('/login', (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
-  const password = req.body.password || '';
+app.post('/login', loginLimiter, (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const password = typeof body.password === 'string' ? body.password : '';
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
 
-  if (!user || user.is_suspended || !bcrypt.compareSync(password, user.password_hash)) {
+  if (!user || user.is_suspended || Buffer.byteLength(password, 'utf8') > 72 || !bcrypt.compareSync(password, user.password_hash)) {
     setFlash(req, 'E-mail ou senha inválidos.', 'danger');
     return res.redirect('/login');
   }
@@ -921,27 +1218,46 @@ app.post('/login', (req, res) => {
 
 app.get('/register', (req, res) => {
   if (req.session.user) return res.redirect('/profile');
-  res.render('register', { pageTitle: 'Cadastro' });
+  res.render('register', { pageTitle: 'Cadastro', formData: { name: '', email: '' } });
 });
 
-app.post('/register', (req, res) => {
-  const name = (req.body.name || '').trim();
-  const email = (req.body.email || '').trim().toLowerCase();
-  const password = req.body.password || '';
+function renderRegistrationError(req, res, message, formData, status = 400) {
+  delete req.session.flash;
+  return res.status(status).render('register', {
+    pageTitle: 'Cadastro',
+    formData,
+    flash: { message, type: 'warning' }
+  });
+}
 
-  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10) {
-    setFlash(req, 'Informe nome e e-mail válidos. A senha deve ter pelo menos 10 caracteres.', 'warning');
-    return res.redirect('/register');
+app.post('/register', registrationLimiter, (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const password = typeof body.password === 'string' ? body.password : '';
+  const formData = { name, email };
+
+  if (name.length < 2 || name.length > 80 || email.length > 254 ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 7 || Buffer.byteLength(password, 'utf8') > 72) {
+    return renderRegistrationError(req, res, 'Confira nome e e-mail. A senha deve ter entre 7 e 72 bytes.', formData);
   }
 
   const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
   if (existing) {
-    setFlash(req, 'Esse e-mail já está cadastrado.', 'danger');
-    return res.redirect('/register');
+    return renderRegistrationError(req, res, 'Esse e-mail já está cadastrado. Entre na sua conta ou use outro e-mail.', formData);
   }
 
   const passwordHash = bcrypt.hashSync(password, 10);
-  const result = db.prepare('INSERT INTO users (name, email, password_hash, avatar_url) VALUES (?, ?, ?, ?)').run(name, email, passwordHash, '/images/default-avatar.svg');
+  let result;
+  try {
+    result = db.prepare('INSERT INTO users (name, email, password_hash, avatar_url) VALUES (?, ?, ?, ?)').run(name, email, passwordHash, '/images/default-avatar.svg');
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      return renderRegistrationError(req, res, 'Esse e-mail já está cadastrado. Entre na sua conta ou use outro e-mail.', formData);
+    }
+    console.error('Não foi possível criar a conta.', error);
+    return renderRegistrationError(req, res, 'Não foi possível criar sua conta agora. Tente novamente.', formData, 500);
+  }
   const user = {
     id: Number(result.lastInsertRowid),
     name,
@@ -968,8 +1284,9 @@ app.get('/recover', (req, res) => {
   res.render('recover', { pageTitle: 'Recuperar senha' });
 });
 
-app.post('/recover', async (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
+app.post('/recover', recoveryLimiter, async (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   const genericMessage = 'Se a conta existir, enviaremos instruções para o e-mail cadastrado.';
 
@@ -1006,6 +1323,8 @@ app.post('/recover', async (req, res) => {
 });
 
 app.get('/reset/:token', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
   const tokenHash = crypto.createHash('sha256').update(req.params.token).digest('hex');
   const reset = db.prepare("SELECT * FROM password_resets WHERE token = ? AND julianday(expires_at) > julianday('now')").get(tokenHash);
   if (!reset) {
@@ -1016,7 +1335,7 @@ app.get('/reset/:token', (req, res) => {
   res.render('reset-password', { token: req.params.token, pageTitle: 'Redefinir senha' });
 });
 
-app.post('/reset/:token', (req, res) => {
+app.post('/reset/:token', resetLimiter, (req, res) => {
   const tokenHash = crypto.createHash('sha256').update(req.params.token).digest('hex');
   const reset = db.prepare("SELECT * FROM password_resets WHERE token = ? AND julianday(expires_at) > julianday('now')").get(tokenHash);
   if (!reset) {
@@ -1024,9 +1343,10 @@ app.post('/reset/:token', (req, res) => {
     return res.redirect('/recover');
   }
 
-  const password = req.body.password || '';
-  if (password.length < 10) {
-    setFlash(req, 'A nova senha deve ter pelo menos 10 caracteres.', 'warning');
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const password = typeof body.password === 'string' ? body.password : '';
+  if (password.length < 7 || Buffer.byteLength(password, 'utf8') > 72) {
+    setFlash(req, 'A nova senha deve ter de 7 a 72 bytes.', 'warning');
     return res.redirect(`/reset/${req.params.token}`);
   }
 
@@ -1034,6 +1354,7 @@ app.post('/reset/:token', (req, res) => {
   db.transaction(() => {
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, reset.user_id);
     db.prepare('DELETE FROM password_resets WHERE user_id = ?').run(reset.user_id);
+    db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(reset.user_id);
   })();
 
   setFlash(req, 'Senha redefinida com sucesso!', 'success');
@@ -1069,10 +1390,11 @@ app.get('/profile/edit', requireAuth, (req, res) => {
   res.render('profile-edit', { userData, pageTitle: 'Editar perfil' });
 });
 
-app.post('/profile/edit', requireAuth, upload.single('avatar'), verifyUploadedImage, (req, res, next) => {
-  const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
-  const bio = typeof req.body.bio === 'string' ? req.body.bio.trim() : '';
-  const avatarUrl = typeof req.body.avatar_url === 'string' ? req.body.avatar_url.trim() : '';
+app.post('/profile/edit', requireAuth, writeLimiter, uploadLimiter, upload.single('avatar'), verifyUploadedImage, (req, res, next) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const bio = typeof body.bio === 'string' ? body.bio.trim() : '';
+  const avatarUrl = typeof body.avatar_url === 'string' ? body.avatar_url.trim() : '';
 
   if (name.length < 2 || name.length > 80 || bio.length > 500 ||
       avatarUrl.length > 2000 || !isSafeImageUrl(avatarUrl)) {
@@ -1081,12 +1403,14 @@ app.post('/profile/edit', requireAuth, upload.single('avatar'), verifyUploadedIm
     return res.redirect('/profile/edit');
   }
 
-  const nextAvatar = req.file ? `/uploads/${req.file.filename}` : (avatarUrl || req.session.user.avatar_url || '/images/default-avatar.svg');
+  const previousAvatar = req.session.user.avatar_url;
+  const nextAvatar = req.file ? `/uploads/${req.file.filename}` : (avatarUrl || previousAvatar || '/images/default-avatar.svg');
   db.prepare('UPDATE users SET name = ?, bio = ?, avatar_url = ? WHERE id = ?')
     .run(name, bio, nextAvatar, req.session.user.id);
   req.session.user.name = name;
   req.session.user.bio = bio;
   req.session.user.avatar_url = nextAvatar;
+  if (previousAvatar !== nextAvatar) removeUploadedFile(previousAvatar);
   setFlash(req, 'Perfil atualizado.', 'success');
   req.session.save((error) => {
     if (error) return next(error);
@@ -1128,7 +1452,7 @@ app.get('/new-recipe', requireAuth, (req, res) => {
   res.render('recipe-form', { mode: 'create', recipe: null, pageTitle: 'Nova receita' });
 });
 
-app.post('/new-recipe', requireAuth, upload.single('photo'), verifyUploadedImage, (req, res) => {
+app.post('/new-recipe', requireAuth, writeLimiter, uploadLimiter, upload.single('photo'), verifyUploadedImage, (req, res) => {
   const parsed = parseRecipeForm(req.body);
   if (parsed.error) {
     if (req.file) fs.unlinkSync(req.file.path);
@@ -1137,12 +1461,12 @@ app.post('/new-recipe', requireAuth, upload.single('photo'), verifyUploadedImage
   }
 
   const fields = parsed.value;
-  const photoUrl = req.file ? `/uploads/${req.file.filename}` : (fields.photoUrl || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80');
+  const photoUrl = req.file ? `/uploads/${req.file.filename}` : (fields.photoUrl || '');
 
   const result = db.prepare(`
-    INSERT INTO recipes (user_id, title, category, description, photo_url, ingredients_json, steps_json, prep_time, servings, difficulty)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(req.session.user.id, fields.title, fields.category, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty);
+    INSERT INTO recipes (user_id, title, category, state, description, photo_url, ingredients_json, steps_json, prep_time, servings, difficulty)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(req.session.user.id, fields.title, fields.category, fields.state, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty);
 
   setFlash(req, 'Receita publicada com sucesso!', 'success');
   res.redirect(`/recipe/${result.lastInsertRowid}`);
@@ -1166,7 +1490,8 @@ app.get('/admin', requireAdmin, (req, res) => {
   };
 
   const recipes = db.prepare(`
-    SELECT r.id, r.title, r.category, r.photo_url, r.created_at, u.name AS author_name
+    SELECT r.id, r.title, r.category, r.photo_url, r.photo_credit, r.photo_source_url,
+           r.photo_license, r.photo_illustrative, r.created_at, u.name AS author_name
     FROM recipes r
     JOIN users u ON u.id = r.user_id
     ORDER BY r.created_at DESC
@@ -1183,13 +1508,13 @@ app.get('/admin', requireAdmin, (req, res) => {
   res.render('admin', { reports, recipes, users, stats, pageTitle: 'Administração' });
 });
 
-app.post('/admin/resolve/:id', requireAdmin, (req, res) => {
+app.post('/admin/resolve/:id', requireAdmin, writeLimiter, (req, res) => {
   db.prepare('UPDATE reports SET status = ? WHERE id = ?').run('resolved', req.params.id);
   setFlash(req, 'Denúncia resolvida.', 'success');
   res.redirect('/admin');
 });
 
-app.post('/admin/comment/:id/delete', requireAdmin, (req, res) => {
+app.post('/admin/comment/:id/delete', requireAdmin, writeLimiter, (req, res) => {
   const comment = db.prepare('SELECT id FROM comments WHERE id = ?').get(req.params.id);
   if (comment) {
     db.transaction(() => {
@@ -1202,7 +1527,7 @@ app.post('/admin/comment/:id/delete', requireAdmin, (req, res) => {
   res.redirect('/admin');
 });
 
-app.post('/admin/user/:id/toggle-suspension', requireAdmin, (req, res) => {
+app.post('/admin/user/:id/toggle-suspension', requireAdmin, writeLimiter, (req, res) => {
   const target = db.prepare('SELECT id, is_admin, is_suspended FROM users WHERE id = ?').get(req.params.id);
   if (!target || target.is_admin || target.id === req.session.user.id) {
     setFlash(req, 'Essa conta não pode ser moderada por esta ação.', 'warning');
@@ -1216,7 +1541,7 @@ app.post('/admin/user/:id/toggle-suspension', requireAdmin, (req, res) => {
   res.redirect('/admin');
 });
 
-app.post('/admin/recipe/:id/delete', requireAdmin, (req, res) => {
+app.post('/admin/recipe/:id/delete', requireAdmin, writeLimiter, (req, res) => {
   removeRecipe(req.params.id);
   setFlash(req, 'Receita removida pela moderação.', 'success');
   res.redirect('/admin');
@@ -1257,6 +1582,8 @@ app.use((err, req, res, next) => {
 });
 
 app.use((error, req, res, next) => {
+  if (error.type === 'entity.too.large') return res.status(413).send('Os dados enviados excedem o limite permitido.');
+  if (error.type === 'entity.parse.failed') return res.status(400).send('O corpo da solicitaÃ§Ã£o estÃ¡ invÃ¡lido.');
   console.error('Erro não tratado durante uma requisição.', error);
   if (res.headersSent) return next(error);
   res.status(500).send('Ocorreu um erro interno. Tente novamente mais tarde.');
@@ -1266,6 +1593,7 @@ app.use((req, res) => {
   res.status(404).render('not-found', { pageTitle: 'Página não encontrada' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Receitas de Todos rodando em http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  const displayHost = HOST.includes(':') && !HOST.startsWith('[') ? `[${HOST}]` : HOST;
+  console.log(`Receitas de Todos rodando em http://${displayHost}:${PORT}`);
 });

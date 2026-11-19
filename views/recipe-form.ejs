@@ -28,6 +28,15 @@
         </select>
       </label>
       <label>
+        Estado (opcional)
+        <select name="state">
+          <option value="">Não informar</option>
+          <% states.forEach(([code, name]) => { %>
+            <option value="<%= code %>" <%= recipe && recipe.state === code ? 'selected' : '' %>><%= name %></option>
+          <% }) %>
+        </select>
+      </label>
+      <label>
         Dificuldade
         <select name="difficulty" required>
           <option value="">Selecione</option>
@@ -59,11 +68,12 @@
         <img src="<%= recipe && recipe.photo_url ? recipe.photo_url : '' %>" alt="Prévia da foto da receita" data-image-preview />
         <span data-image-preview-caption><%= recipe && recipe.photo_url ? 'Foto atual' : 'Prévia da imagem' %></span>
       </div>
+      <% if (recipe) { %><%- include('partials/photo-credit', { recipe }) %><% } %>
     </div>
 
     <label>
       URL da imagem (opcional)
-      <input type="url" name="photo_url" value="<%= recipe && recipe.photo_url && !recipe.photo_url.startsWith('/uploads/') ? recipe.photo_url : '' %>" placeholder="https://..." data-image-url />
+      <input type="url" name="photo_url" value="<%= recipe && recipe.photo_url && !recipe.photo_url.startsWith('/uploads/') && !recipe.photo_url.startsWith('/images/') ? recipe.photo_url : '' %>" placeholder="https://..." data-image-url />
     </label>
 
     <label>

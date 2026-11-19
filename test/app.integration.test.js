@@ -40,6 +40,8 @@ async function startApp() {
       ...process.env,
       NODE_ENV: 'development',
       PORT: String(port),
+      HOST: '127.0.0.1',
+      ADMIN_PASSWORD: 'admin123',
       SESSION_SECRET: 'integration-test-secret-with-enough-length',
       DATA_DIR: path.join(appState.root, 'data'),
       UPLOAD_DIR: path.join(appState.root, 'uploads')
