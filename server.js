@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const multer = require('multer');
-const nodemailer = require('nodemailer');
 const Database = require('better-sqlite3');
 
 const app = express();
@@ -41,37 +40,6 @@ if (isProduction && (process.env.SESSION_SECRET.length < 32 || process.env.ADMIN
 if (process.env.ADMIN_PASSWORD && Buffer.byteLength(process.env.ADMIN_PASSWORD, 'utf8') > 72) {
   throw new Error('ADMIN_PASSWORD deve ter no mÃ¡ximo 72 bytes para ser compatÃ­vel com bcrypt.');
 }
-
-const smtpHost = process.env.SMTP_HOST;
-const smtpFrom = process.env.SMTP_FROM;
-const smtpUser = process.env.SMTP_USER;
-const smtpPass = process.env.SMTP_PASS;
-const smtpPort = Number(process.env.SMTP_PORT || 587);
-if ((smtpHost || smtpFrom || smtpUser || smtpPass || process.env.SMTP_PORT) &&
-    (!smtpHost || !smtpFrom || !Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535 || Boolean(smtpUser) !== Boolean(smtpPass))) {
-  throw new Error('A configuração SMTP está incompleta ou inválida. Configure host, remetente, porta e usuário/senha em conjunto.');
-}
-if (isProduction && smtpHost && !process.env.APP_BASE_URL) {
-  throw new Error('Configure APP_BASE_URL em produção para gerar links seguros de recuperação de senha.');
-}
-if (isProduction && process.env.APP_BASE_URL) {
-  let baseUrl;
-  try {
-    baseUrl = new URL(process.env.APP_BASE_URL);
-  } catch (_error) {
-    throw new Error('APP_BASE_URL deve ser uma URL válida com HTTPS.');
-  }
-  if (baseUrl.protocol !== 'https:') throw new Error('APP_BASE_URL deve usar HTTPS em produção.');
-}
-
-const mailer = smtpHost
-  ? nodemailer.createTransport({
-      host: smtpHost,
-      port: smtpPort,
-      secure: smtpPort === 465,
-      ...(smtpUser ? { auth: { user: smtpUser, pass: smtpPass } } : {})
-    })
-  : null;
 
 const db = new Database(dbPath);
 db.pragma('foreign_keys = ON');
@@ -230,6 +198,20 @@ function parseLines(value) {
     .filter(Boolean);
 }
 
+function normalizeEmailForDuplicateCheck(email) {
+  const normalized = email.trim().toLowerCase();
+  const separator = normalized.lastIndexOf('@');
+  if (separator < 0) return normalized;
+
+  let localPart = normalized.slice(0, separator);
+  let domain = normalized.slice(separator + 1);
+  if (domain === 'gmail.com' || domain === 'googlemail.com') {
+    localPart = localPart.split('+', 1)[0].replace(/\./g, '');
+    domain = 'gmail.com';
+  }
+  return `${localPart}@${domain}`;
+}
+
 function getPrepTimeMinutes(value) {
   const match = String(value || '').match(/^\s*(\d+)/);
   return match ? Number(match[1]) : 0;
@@ -270,8 +252,6 @@ function createRateLimiter({ windowMs, max, message }) {
 
 const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, message: 'Muitas tentativas de login. Aguarde 15 minutos e tente novamente.' });
 const registrationLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 10, message: 'Muitas tentativas de cadastro. Aguarde uma hora e tente novamente.' });
-const recoveryLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 5, message: 'Muitos pedidos de recuperação. Aguarde uma hora e tente novamente.' });
-const resetLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, message: 'Muitas tentativas para redefinir a senha. Aguarde 15 minutos.' });
 const uploadLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, message: 'Limite de uploads atingido. Tente novamente daqui a uma hora.' });
 const writeLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 120, message: 'Muitas ações em pouco tempo. Aguarde 15 minutos.' });
 
@@ -533,16 +513,6 @@ function initializeDatabase() {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS password_resets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      token TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(token),
-      FOREIGN KEY (user_id) REFERENCES users(id)
-    );
-
     CREATE TABLE IF NOT EXISTS web_sessions (
       sid TEXT PRIMARY KEY,
       sess TEXT NOT NULL,
@@ -582,7 +552,7 @@ function initializeDatabase() {
   }
   db.exec('CREATE INDEX IF NOT EXISTS recipes_state_idx ON recipes(state)');
 
-  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@receitasdetodos.com').trim().toLowerCase();
+  const adminEmail = (process.env.ADMIN_EMAIL || 'receitaadmin@sdetodos.com').trim().toLowerCase();
   const adminPassword = process.env.ADMIN_PASSWORD || crypto.randomBytes(24).toString('base64url');
   const existingAdmin = db.prepare('SELECT id, password_hash FROM users WHERE email = ?').get(adminEmail);
   if (!existingAdmin) {
@@ -763,6 +733,7 @@ function initializeDatabase() {
 }
 
 initializeDatabase();
+db.exec('DROP TABLE IF EXISTS password_resets');
 db.pragma('journal_mode = WAL');
 
 app.disable('x-powered-by');
@@ -1239,24 +1210,43 @@ app.post('/register', registrationLimiter, (req, res) => {
 
   if (name.length < 2 || name.length > 80 || email.length > 254 ||
       !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 7 || Buffer.byteLength(password, 'utf8') > 72) {
-    return renderRegistrationError(req, res, 'Confira nome e e-mail. A senha deve ter entre 7 e 72 bytes.', formData);
+    return renderRegistrationError(req, res, 'Confira os dados. A senha deve ter pelo menos 7 caracteres.', formData);
   }
 
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-  if (existing) {
+  const existing = db.prepare(`
+    SELECT id, email FROM users
+    WHERE lower(email) = ?
+      OR lower(email) LIKE '%@gmail.com'
+      OR lower(email) LIKE '%@googlemail.com'
+  `).all(email);
+  if (existing.some((user) => normalizeEmailForDuplicateCheck(user.email) === normalizeEmailForDuplicateCheck(email))) {
     return renderRegistrationError(req, res, 'Esse e-mail já está cadastrado. Entre na sua conta ou use outro e-mail.', formData);
   }
 
   const passwordHash = bcrypt.hashSync(password, 10);
   let result;
   try {
-    result = db.prepare('INSERT INTO users (name, email, password_hash, avatar_url) VALUES (?, ?, ?, ?)').run(name, email, passwordHash, '/images/default-avatar.svg');
+    result = db.transaction(() => {
+      const possibleDuplicates = db.prepare(`
+        SELECT email FROM users
+        WHERE lower(email) = ?
+          OR lower(email) LIKE '%@gmail.com'
+          OR lower(email) LIKE '%@googlemail.com'
+      `).all(email);
+      const normalizedEmail = normalizeEmailForDuplicateCheck(email);
+      if (possibleDuplicates.some((user) => normalizeEmailForDuplicateCheck(user.email) === normalizedEmail)) return null;
+      return db.prepare('INSERT INTO users (name, email, password_hash, avatar_url) VALUES (?, ?, ?, ?)')
+        .run(name, email, passwordHash, '/images/default-avatar.svg');
+    }).immediate();
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
       return renderRegistrationError(req, res, 'Esse e-mail já está cadastrado. Entre na sua conta ou use outro e-mail.', formData);
     }
     console.error('Não foi possível criar a conta.', error);
     return renderRegistrationError(req, res, 'Não foi possível criar sua conta agora. Tente novamente.', formData, 500);
+  }
+  if (!result) {
+    return renderRegistrationError(req, res, 'Esse e-mail jÃ¡ estÃ¡ cadastrado. Entre na sua conta ou use outro e-mail.', formData);
   }
   const user = {
     id: Number(result.lastInsertRowid),
@@ -1278,87 +1268,6 @@ app.post('/logout', (req, res, next) => {
     if (error) return next(error);
     res.redirect('/');
   });
-});
-
-app.get('/recover', (req, res) => {
-  res.render('recover', { pageTitle: 'Recuperar senha' });
-});
-
-app.post('/recover', recoveryLimiter, async (req, res) => {
-  const body = req.body && typeof req.body === 'object' ? req.body : {};
-  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  const genericMessage = 'Se a conta existir, enviaremos instruções para o e-mail cadastrado.';
-
-  if (!mailer) {
-    setFlash(req, 'A recuperação de senha está temporariamente indisponível porque o serviço de e-mail não está configurado.', 'warning');
-    return res.redirect('/recover');
-  }
-
-  if (user) {
-    const token = crypto.randomBytes(32).toString('hex');
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    const baseUrl = (process.env.APP_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-    db.prepare('DELETE FROM password_resets WHERE user_id = ?').run(user.id);
-    db.prepare('INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)').run(user.id, tokenHash, expiresAt);
-
-    try {
-      await mailer.sendMail({
-        from: smtpFrom,
-        to: user.email,
-        subject: 'Redefinição da senha — Receitas de Todos',
-        text: `Use este link para redefinir sua senha (válido por 1 hora): ${baseUrl}/reset/${token}`
-      });
-    } catch (error) {
-      db.prepare('DELETE FROM password_resets WHERE token = ?').run(tokenHash);
-      console.error('Falha ao enviar e-mail de recuperação de senha.', error);
-      setFlash(req, 'Não foi possível enviar o e-mail de recuperação. Tente novamente mais tarde.', 'danger');
-      return res.redirect('/recover');
-    }
-  }
-
-  setFlash(req, genericMessage, 'info');
-  res.redirect('/recover');
-});
-
-app.get('/reset/:token', (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  const tokenHash = crypto.createHash('sha256').update(req.params.token).digest('hex');
-  const reset = db.prepare("SELECT * FROM password_resets WHERE token = ? AND julianday(expires_at) > julianday('now')").get(tokenHash);
-  if (!reset) {
-    setFlash(req, 'Token inválido ou expirado.', 'danger');
-    return res.redirect('/recover');
-  }
-
-  res.render('reset-password', { token: req.params.token, pageTitle: 'Redefinir senha' });
-});
-
-app.post('/reset/:token', resetLimiter, (req, res) => {
-  const tokenHash = crypto.createHash('sha256').update(req.params.token).digest('hex');
-  const reset = db.prepare("SELECT * FROM password_resets WHERE token = ? AND julianday(expires_at) > julianday('now')").get(tokenHash);
-  if (!reset) {
-    setFlash(req, 'Token inválido ou expirado.', 'danger');
-    return res.redirect('/recover');
-  }
-
-  const body = req.body && typeof req.body === 'object' ? req.body : {};
-  const password = typeof body.password === 'string' ? body.password : '';
-  if (password.length < 7 || Buffer.byteLength(password, 'utf8') > 72) {
-    setFlash(req, 'A nova senha deve ter de 7 a 72 bytes.', 'warning');
-    return res.redirect(`/reset/${req.params.token}`);
-  }
-
-  const passwordHash = bcrypt.hashSync(password, 10);
-  db.transaction(() => {
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, reset.user_id);
-    db.prepare('DELETE FROM password_resets WHERE user_id = ?').run(reset.user_id);
-    db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(reset.user_id);
-  })();
-
-  setFlash(req, 'Senha redefinida com sucesso!', 'success');
-  res.redirect('/login');
 });
 
 app.get('/profile', requireAuth, (req, res) => {

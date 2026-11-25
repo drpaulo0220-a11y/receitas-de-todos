@@ -129,18 +129,6 @@ test('community workflows, moderation, upload, and persistent sessions', async (
   assert.equal(profileUpdate.headers.get('location'), '/profile');
   assert.match(await (await request('/profile', { cookieKey: 'userCookie' })).text(), /Pessoa Editada/);
 
-  const unavailableRecovery = await request('/recover', {
-    method: 'POST',
-    body: new URLSearchParams({ email: 'person@example.test' }),
-    cookieKey: 'userCookie'
-  });
-  assert.equal(unavailableRecovery.headers.get('location'), '/recover');
-  const recoveryPage = await request('/recover', { cookieKey: 'userCookie' });
-  assert.match(await recoveryPage.text(), /serviço de e-mail não está configurado/);
-  const recoveryDb = new Database(path.join(appState.root, 'data', 'recipes.db'));
-  assert.equal(recoveryDb.prepare('SELECT COUNT(*) AS count FROM password_resets').get().count, 0);
-  recoveryDb.close();
-
   const invalidImageForm = new FormData();
   invalidImageForm.set('title', 'Upload inválido');
   invalidImageForm.set('description', 'Este envio deve ser recusado pelo servidor.');

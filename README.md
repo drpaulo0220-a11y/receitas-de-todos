@@ -39,7 +39,6 @@ Na primeira inicialização, o servidor cria a conta `admin@receitasdetodos.com`
 
 - Home com receitas recentes, populares e em destaque
 - Cadastro e login com autenticação real em servidor
-- Recuperação de senha com link temporário enviado por SMTP
 - Sessões persistidas no SQLite
 - Publicação, edição e exclusão de receitas
 - Curtidas, favoritos e avaliações por estrelas
@@ -75,18 +74,7 @@ UPLOAD_DIR=<caminho do volume persistente para as imagens>
 
 `SESSION_SECRET` deve ter ao menos 32 caracteres e `ADMIN_PASSWORD` entre 12 e 72 bytes. O comando de inicialização é `npm start`. Em desenvolvimento, o servidor escuta apenas em `127.0.0.1`; para expor na rede, configure `HOST`, `SESSION_SECRET` forte e `ADMIN_PASSWORD` forte. Em produção, `DATA_DIR` e `UPLOAD_DIR` são obrigatórios: aponte ambos para armazenamento persistente do provedor. Um exemplo de montagem é `DATA_DIR=/var/data` e `UPLOAD_DIR=/var/data/uploads`. Serviços com disco temporário podem apagar banco e imagens após reinicializações; não publique com armazenamento efêmero.
 
-Para habilitar recuperação por e-mail, configure também:
-
-```text
-SMTP_HOST=<servidor SMTP>
-SMTP_PORT=587
-SMTP_FROM=<remetente verificado>
-SMTP_USER=<usuário SMTP>
-SMTP_PASS=<senha ou chave SMTP>
-APP_BASE_URL=https://seu-dominio.example
-```
-
-Se SMTP não estiver configurado, o formulário informa que a recuperação está indisponível e não revela nem exibe tokens. O banco SQLite, sessões e imagens agora podem persistir em um volume único; para escalar para várias instâncias, migre para PostgreSQL e armazenamento de objetos.
+O banco SQLite, as sessoes e as imagens podem ficar em armazenamento persistente. Para varias instancias, migre para PostgreSQL e armazenamento de objetos.
 
 Para instalar no celular, publique o site com HTTPS e use “Adicionar à tela inicial” no navegador. O service worker mantém os recursos estáticos disponíveis em cache; as páginas e dados do usuário precisam de conexão.
 
@@ -95,7 +83,6 @@ As credenciais administrativas por variável de ambiente são aplicadas quando o
 ## O que ainda pode ser aprimorado
 
 - Upload de imagens para storage externo (Cloudinary ou Supabase Storage)
-- Configurar SMTP e domínio verificado no provedor de e-mail
 - Migração do SQLite local para banco gerenciado em produção
 - Cache e SEO mais robustos
 - Dashboard analítico para moderadores
