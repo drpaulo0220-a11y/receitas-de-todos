@@ -19,6 +19,10 @@ const databaseUrl = process.env.DATABASE_URL;
 const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const storageBucket = process.env.SUPABASE_STORAGE_BUCKET || 'recipe-images';
+const adsenseClientId = (process.env.ADSENSE_CLIENT_ID || '').trim();
+if (adsenseClientId && !/^ca-pub-\d+$/.test(adsenseClientId)) {
+  throw new Error('ADSENSE_CLIENT_ID deve estar no formato ca-pub- seguido de números.');
+}
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT deve ser um nÃºmero entre 1 e 65535.');
 if (!isProduction && !LOOPBACK_HOSTS.has(HOST) &&
     (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32 ||
@@ -813,6 +817,7 @@ app.use((req, res, next) => {
   res.locals.categories = CATEGORIES;
   res.locals.states = BRAZIL_STATES;
   res.locals.photoLicenseUrl = getPhotoLicenseUrl;
+  res.locals.adsenseClientId = adsenseClientId;
   res.locals.formatDate = formatDate;
   res.locals.prepTimeMinutes = getPrepTimeMinutes;
   res.locals.flash = req.session.flash || null;

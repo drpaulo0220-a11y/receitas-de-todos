@@ -361,7 +361,7 @@ button, input, textarea, select { font: inherit; }
   gap: 20px;
 }
 
-.feature-card, .panel, .ad-card {
+.feature-card, .panel {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 20px;
@@ -370,15 +370,6 @@ button, input, textarea, select { font: inherit; }
 }
 
 .feature-card h3 { margin-top: 0; }
-
-.ad-card {
-  display: grid;
-  place-items: center;
-  min-height: 120px;
-  color: var(--muted);
-  font-weight: 700;
-  background: linear-gradient(135deg, #fef5ea, #fff);
-}
 
 .auth-shell {
   max-width: 480px;

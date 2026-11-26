@@ -8,6 +8,9 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="description" content="<%= metaDescription %>" />
     <title><%= pageTitle || 'Receitas de Todos' %></title>
+    <% if (adsenseClientId) { %>
+      <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=<%= adsenseClientId %>" crossorigin="anonymous"></script>
+    <% } %>
     <link rel="manifest" href="/site.webmanifest" />
     <link rel="apple-touch-icon" href="/images/default-recipe.svg" />
     <link rel="stylesheet" href="/styles.css" />

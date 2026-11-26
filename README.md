@@ -55,7 +55,7 @@ Na primeira inicialização local, o servidor cria a conta `receitaadmin@sdetodo
 - Páginas de Sobre, Contato, Privacidade e Termos
 - PWA instalável e interface adaptada para celular
 - Compartilhamento nativo/link copiável das receitas e metadados SEO por receita
-- Espaços reservados para futuro Google AdSense
+- Integração preparada para o script Google AdSense, ativada por variável de ambiente
 
 ## Banco de dados e arquivos
 
@@ -89,6 +89,10 @@ Os planos gratuitos têm limites de uso e disponibilidade; o Supabase pode pausa
 Para instalar no celular, publique o site com HTTPS e use “Adicionar à tela inicial” no navegador. O service worker mantém os recursos estáticos disponíveis em cache; as páginas e dados do usuário precisam de conexão.
 
 As credenciais administrativas por variável de ambiente são aplicadas quando o servidor inicia. Se o e-mail configurado já existir, a senha fornecida passa a ser a senha administrativa desse usuário.
+
+## Google AdSense
+
+Depois que o Google aceitar `receitas-de-todos.onrender.com` e aprovar o site, copie o Publisher ID no formato `ca-pub-...` do snippet do AdSense e defina `ADSENSE_CLIENT_ID` nas variáveis do serviço Render. O ID é inserido no `<head>` compartilhado de todas as páginas. Não cole o snippet inteiro em `render.yaml` nem no código. Os anúncios só serão exibidos após a aprovação e a configuração de anúncios automáticos no AdSense.
 
 ## O que ainda pode ser aprimorado
 

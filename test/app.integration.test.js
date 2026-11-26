@@ -54,6 +54,7 @@ async function startApp() {
       DATABASE_URL: testDatabaseUrl,
       SUPABASE_URL: '',
       SUPABASE_SERVICE_ROLE_KEY: '',
+      ADSENSE_CLIENT_ID: 'ca-pub-1234567890123456',
       DATA_DIR: path.join(appState.root, 'data'),
       UPLOAD_DIR: path.join(appState.root, 'uploads')
     },
@@ -130,7 +131,9 @@ test('community workflows, moderation, upload, and persistent sessions', async (
 
   const listing = await request('/recipes?max_time=30');
   assert.equal(listing.status, 200);
-  assert.match(await listing.text(), /Salada de quinoa tropical/);
+  const listingHtml = await listing.text();
+  assert.match(listingHtml, /Salada de quinoa tropical/);
+  assert.match(listingHtml, /adsbygoogle\.js\?client=ca-pub-1234567890123456/);
 
   const register = await request('/register', {
     method: 'POST',
