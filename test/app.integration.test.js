@@ -7,8 +7,15 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const Database = require('better-sqlite3');
+const { Pool } = require('pg');
+const { toPostgresPlaceholders } = require('../database');
 
 const projectRoot = path.resolve(__dirname, '..');
+const testDatabaseUrl = process.env.TEST_DATABASE_URL || '';
+if (testDatabaseUrl && !new URL(testDatabaseUrl).pathname.slice(1).split('?')[0].endsWith('_test')) {
+  throw new Error('TEST_DATABASE_URL must point to a database ending in _test');
+}
+const postgresTestPool = testDatabaseUrl ? new Pool({ connectionString: testDatabaseUrl }) : null;
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAFfc0b9AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJ0UkGAAAAAAgIY0NdbAAAAABJRU5ErkJggg==', 'base64');
 const appState = {
   process: null,
@@ -41,8 +48,12 @@ async function startApp() {
       NODE_ENV: 'development',
       PORT: String(port),
       HOST: '127.0.0.1',
+      ADMIN_EMAIL: 'receitaadmin@sdetodos.com',
       ADMIN_PASSWORD: 'admin123',
       SESSION_SECRET: 'integration-test-secret-with-enough-length',
+      DATABASE_URL: testDatabaseUrl,
+      SUPABASE_URL: '',
+      SUPABASE_SERVICE_ROLE_KEY: '',
       DATA_DIR: path.join(appState.root, 'data'),
       UPLOAD_DIR: path.join(appState.root, 'uploads')
     },
@@ -88,6 +99,20 @@ async function request(pathname, { method = 'GET', body, cookieKey } = {}) {
   return response;
 }
 
+async function getDatabaseRow(sql, ...values) {
+  if (postgresTestPool) {
+    const result = await postgresTestPool.query(toPostgresPlaceholders(sql), values);
+    return result.rows[0];
+  }
+
+  const database = new Database(path.join(appState.root, 'data', 'recipes.db'));
+  try {
+    return database.prepare(sql).get(...values);
+  } finally {
+    database.close();
+  }
+}
+
 test('community workflows, moderation, upload, and persistent sessions', async (t) => {
   appState.root = fs.mkdtempSync(path.join(os.tmpdir(), 'recipes-integration-'));
   fs.mkdirSync(path.join(appState.root, 'data'), { recursive: true });
@@ -95,7 +120,11 @@ test('community workflows, moderation, upload, and persistent sessions', async (
   t.after(async () => {
     await stopApp();
     fs.rmSync(appState.root, { recursive: true, force: true });
+    if (postgresTestPool) await postgresTestPool.end();
   });
+  if (postgresTestPool) {
+    await postgresTestPool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
+  }
 
   await startApp();
 
@@ -112,10 +141,8 @@ test('community workflows, moderation, upload, and persistent sessions', async (
     }),
     cookieKey: 'userCookie'
   });
-  assert.equal(register.status, 302);
-  const accountDb = new Database(path.join(appState.root, 'data', 'recipes.db'));
-  appState.userId = accountDb.prepare('SELECT id FROM users WHERE email = ?').get('person@example.test').id;
-  accountDb.close();
+  assert.equal(register.status, 302, appState.output);
+  appState.userId = (await getDatabaseRow('SELECT id FROM users WHERE email = ?', 'person@example.test')).id;
 
   const profileUpdate = await request('/profile/edit', {
     method: 'POST',
@@ -185,9 +212,7 @@ test('community workflows, moderation, upload, and persistent sessions', async (
     body: new URLSearchParams({ body: 'Comentário principal' }),
     cookieKey: 'userCookie'
   });
-  const commentDb = new Database(path.join(appState.root, 'data', 'recipes.db'));
-  const rootCommentId = commentDb.prepare('SELECT id FROM comments WHERE recipe_id = ? AND parent_id IS NULL').get(appState.recipeId).id;
-  commentDb.close();
+  const rootCommentId = (await getDatabaseRow('SELECT id FROM comments WHERE recipe_id = ? AND parent_id IS NULL', appState.recipeId)).id;
   await request(`/recipe/${appState.recipeId}/comment`, {
     method: 'POST',
     body: new URLSearchParams({ parent_id: String(rootCommentId), body: 'Resposta ao comentário' }),
@@ -196,9 +221,7 @@ test('community workflows, moderation, upload, and persistent sessions', async (
   const commentPage = await request(recipeLocation, { cookieKey: 'userCookie' });
   assert.match(await commentPage.text(), /Resposta ao comentário/);
 
-  const replyDb = new Database(path.join(appState.root, 'data', 'recipes.db'));
-  const replyId = replyDb.prepare('SELECT id FROM comments WHERE recipe_id = ? AND parent_id IS NOT NULL').get(appState.recipeId).id;
-  replyDb.close();
+  const replyId = (await getDatabaseRow('SELECT id FROM comments WHERE recipe_id = ? AND parent_id IS NOT NULL', appState.recipeId)).id;
   await request(`/comment/${replyId}/report`, {
     method: 'POST',
     body: new URLSearchParams({ reason: 'Denúncia de teste' }),
@@ -207,7 +230,7 @@ test('community workflows, moderation, upload, and persistent sessions', async (
 
   const adminLogin = await request('/login', {
     method: 'POST',
-    body: new URLSearchParams({ email: 'admin@receitasdetodos.com', password: 'admin123' }),
+    body: new URLSearchParams({ email: 'receitaadmin@sdetodos.com', password: 'admin123' }),
     cookieKey: 'adminCookie'
   });
   assert.equal(adminLogin.status, 302);

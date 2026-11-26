@@ -5,7 +5,8 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const multer = require('multer');
-const Database = require('better-sqlite3');
+const { AppDatabase } = require('./database');
+const { ImageStorage } = require('./storage');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -14,7 +15,10 @@ const HOST = process.env.HOST || (isProduction ? '0.0.0.0' : '127.0.0.1');
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'public', 'uploads'));
-const dbPath = path.join(dataDir, 'recipes.db');
+const databaseUrl = process.env.DATABASE_URL;
+const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const storageBucket = process.env.SUPABASE_STORAGE_BUCKET || 'recipe-images';
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT deve ser um nÃºmero entre 1 e 65535.');
 if (!isProduction && !LOOPBACK_HOSTS.has(HOST) &&
     (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32 ||
@@ -28,11 +32,24 @@ const IMAGE_TYPES = {
   'image/gif': { extension: '.gif', signature: (header) => ['GIF87a', 'GIF89a'].includes(header.toString('ascii', 0, 6)) }
 };
 
-fs.mkdirSync(uploadDir, { recursive: true });
-fs.mkdirSync(dataDir, { recursive: true });
+const imageStorage = new ImageStorage({
+  uploadDir,
+  supabaseUrl,
+  serviceRoleKey: supabaseServiceRoleKey,
+  bucket: storageBucket,
+  imageTypes: IMAGE_TYPES
+});
+const cloudStorageEnabled = imageStorage.enabled;
+if (isProduction && supabaseUrl && new URL(supabaseUrl).protocol !== 'https:') {
+  throw new Error('SUPABASE_URL deve usar HTTPS em produção.');
+}
 
-if (isProduction && (!process.env.SESSION_SECRET || !process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD || !process.env.DATA_DIR || !process.env.UPLOAD_DIR)) {
-  throw new Error('Em produção, configure SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, DATA_DIR e UPLOAD_DIR.');
+if (!databaseUrl) fs.mkdirSync(dataDir, { recursive: true });
+if (!cloudStorageEnabled) fs.mkdirSync(uploadDir, { recursive: true });
+
+if (isProduction && (!process.env.SESSION_SECRET || !process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD ||
+    !databaseUrl || !supabaseUrl || !supabaseServiceRoleKey)) {
+  throw new Error('Em produção, configure SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, DATABASE_URL, SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY.');
 }
 if (isProduction && (process.env.SESSION_SECRET.length < 32 || process.env.ADMIN_PASSWORD.length < 12)) {
   throw new Error('Em produção, SESSION_SECRET deve ter pelo menos 32 caracteres e ADMIN_PASSWORD pelo menos 12.');
@@ -41,21 +58,9 @@ if (process.env.ADMIN_PASSWORD && Buffer.byteLength(process.env.ADMIN_PASSWORD, 
   throw new Error('ADMIN_PASSWORD deve ter no mÃ¡ximo 72 bytes para ser compatÃ­vel com bcrypt.');
 }
 
-const db = new Database(dbPath);
-db.pragma('foreign_keys = ON');
-db.pragma('busy_timeout = 5000');
-const storage = multer.diskStorage({
-  destination: function (_req, _file, cb) {
-    cb(null, uploadDir);
-  },
-  filename: function (_req, file, cb) {
-    const ext = IMAGE_TYPES[file.mimetype]?.extension || '.img';
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-    cb(null, unique);
-  },
-});
+const db = new AppDatabase({ databaseUrl, dataDir });
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: 5 * 1024 * 1024
   },
@@ -72,26 +77,19 @@ function verifyUploadedImage(req, _res, next) {
   if (!req.file) return next();
 
   const imageType = IMAGE_TYPES[req.file.mimetype];
-  const descriptor = fs.openSync(req.file.path, 'r');
   const header = Buffer.alloc(12);
-  try {
-    fs.readSync(descriptor, header, 0, header.length, 0);
-  } finally {
-    fs.closeSync(descriptor);
-  }
+  req.file.buffer.copy(header, 0, 0, header.length);
 
   if (!imageType || !imageType.signature(header)) {
-    fs.unlinkSync(req.file.path);
     return next(new Error('O arquivo enviado não parece ser uma imagem válida.'));
   }
 
   next();
 }
 
-class SqliteSessionStore extends session.Store {
+class DatabaseSessionStore extends session.Store {
   constructor(database) {
     super();
-    this.database = database;
     this.getSession = database.prepare('SELECT sess, expires FROM web_sessions WHERE sid = ?');
     this.saveSession = database.prepare('INSERT INTO web_sessions (sid, sess, expires, user_id) VALUES (?, ?, ?, ?) ON CONFLICT(sid) DO UPDATE SET sess = excluded.sess, expires = excluded.expires, user_id = excluded.user_id');
     this.deleteSession = database.prepare('DELETE FROM web_sessions WHERE sid = ?');
@@ -100,54 +98,52 @@ class SqliteSessionStore extends session.Store {
     this.deleteUserSessions = database.prepare('DELETE FROM web_sessions WHERE user_id = ?');
   }
 
-  get(sid, callback) {
+  async get(sid, callback) {
+    let value = null;
     try {
-      const row = this.getSession.get(sid);
-      if (!row) return callback(null, null);
-      if (row.expires <= Date.now()) {
-        this.deleteSession.run(sid);
-        return callback(null, null);
+      const row = await this.getSession.get(sid);
+      if (row && Number(row.expires) <= Date.now()) {
+        await this.deleteSession.run(sid);
+      } else if (row) {
+        value = JSON.parse(row.sess);
       }
-      return callback(null, JSON.parse(row.sess));
     } catch (error) {
       return callback(error);
     }
+    return callback(null, value);
   }
 
-  set(sid, value, callback) {
-    let error = null;
+  async set(sid, value, callback) {
     try {
       const expires = value.cookie && value.cookie.expires
         ? new Date(value.cookie.expires).getTime()
         : Date.now() + 8 * 60 * 60 * 1000;
-      this.saveSession.run(sid, JSON.stringify(value), expires, value.user ? value.user.id : null);
+      await this.saveSession.run(sid, JSON.stringify(value), expires, value.user ? value.user.id : null);
+      if (callback) callback(null);
     } catch (storeError) {
-      error = storeError;
+      if (callback) callback(storeError);
     }
-    if (callback) callback(error);
   }
 
-  touch(sid, value, callback) {
-    let error = null;
+  async touch(sid, value, callback) {
     try {
       const expires = value.cookie && value.cookie.expires
         ? new Date(value.cookie.expires).getTime()
         : Date.now() + 8 * 60 * 60 * 1000;
-      this.updateExpiry.run(JSON.stringify(value), expires, value.user ? value.user.id : null, sid);
+      await this.updateExpiry.run(JSON.stringify(value), expires, value.user ? value.user.id : null, sid);
+      if (callback) callback(null);
     } catch (storeError) {
-      error = storeError;
+      if (callback) callback(storeError);
     }
-    if (callback) callback(error);
   }
 
-  destroy(sid, callback) {
-    let error = null;
+  async destroy(sid, callback) {
     try {
-      this.deleteSession.run(sid);
+      await this.deleteSession.run(sid);
+      if (callback) callback(null);
     } catch (storeError) {
-      error = storeError;
+      if (callback) callback(storeError);
     }
-    if (callback) callback(error);
   }
 }
 
@@ -310,7 +306,7 @@ function parseRecipeForm(body) {
   };
 }
 
-function getRecipeSummary(params = {}) {
+async function getRecipeSummary(params = {}) {
   const { search = '', category = '', state = '', difficulty = '', maxPrepTime = 0, sort = 'newest', limit = 12, offset = 0 } = params;
   const clauses = ['1 = 1'];
   const values = [];
@@ -342,7 +338,9 @@ function getRecipeSummary(params = {}) {
   }
 
   if (maxPrepTime) {
-    clauses.push('CAST(r.prep_time AS INTEGER) <= ?');
+    clauses.push(db.isPostgres
+      ? "CAST(SPLIT_PART(r.prep_time, ' ', 1) AS INTEGER) <= ?"
+      : 'CAST(r.prep_time AS INTEGER) <= ?');
     values.push(maxPrepTime);
   }
 
@@ -367,11 +365,11 @@ function getRecipeSummary(params = {}) {
     LIMIT ? OFFSET ?
   `;
 
-  return db.prepare(sql).all(...values, limit, offset);
+  return await db.prepare(sql).all(...values, limit, offset);
 }
 
-function getRecipeDetail(id) {
-  return db.prepare(`
+async function getRecipeDetail(id) {
+  return await db.prepare(`
     SELECT
       r.*,
       u.name AS author_name,
@@ -389,34 +387,29 @@ function getRecipeDetail(id) {
   `).get(id);
 }
 
-function removeUploadedFile(photoUrl) {
-  if (typeof photoUrl !== 'string' || !photoUrl.startsWith('/uploads/')) return;
-  const filename = photoUrl.slice('/uploads/'.length);
-  if (!filename || filename !== path.basename(filename)) return;
-  const imagePath = path.resolve(uploadDir, filename);
-  if (path.dirname(imagePath) === uploadDir && fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
-}
+const storeUploadedImage = (file) => imageStorage.store(file);
+const removeUploadedFile = (photoUrl) => imageStorage.remove(photoUrl);
 
-function removeRecipe(recipeId) {
-  const recipe = db.prepare('SELECT id, photo_url FROM recipes WHERE id = ?').get(recipeId);
+async function removeRecipe(recipeId) {
+  const recipe = await db.prepare('SELECT id, photo_url FROM recipes WHERE id = ?').get(recipeId);
   if (!recipe) return false;
 
-  db.transaction(() => {
-    db.prepare("DELETE FROM reports WHERE type = 'comment' AND item_id IN (SELECT id FROM comments WHERE recipe_id = ?)").run(recipeId);
-    db.prepare("DELETE FROM reports WHERE type = 'recipe' AND item_id = ?").run(recipeId);
-    db.prepare('DELETE FROM likes WHERE recipe_id = ?').run(recipeId);
-    db.prepare('DELETE FROM favorites WHERE recipe_id = ?').run(recipeId);
-    db.prepare('DELETE FROM ratings WHERE recipe_id = ?').run(recipeId);
-    db.prepare('DELETE FROM comments WHERE recipe_id = ?').run(recipeId);
-    db.prepare('DELETE FROM recipes WHERE id = ?').run(recipeId);
+  await db.transaction(async () => {
+    await db.prepare("DELETE FROM reports WHERE type = 'comment' AND item_id IN (SELECT id FROM comments WHERE recipe_id = ?)").run(recipeId);
+    await db.prepare("DELETE FROM reports WHERE type = 'recipe' AND item_id = ?").run(recipeId);
+    await db.prepare('DELETE FROM likes WHERE recipe_id = ?').run(recipeId);
+    await db.prepare('DELETE FROM favorites WHERE recipe_id = ?').run(recipeId);
+    await db.prepare('DELETE FROM ratings WHERE recipe_id = ?').run(recipeId);
+    await db.prepare('DELETE FROM comments WHERE recipe_id = ?').run(recipeId);
+    await db.prepare('DELETE FROM recipes WHERE id = ?').run(recipeId);
   })();
 
-  removeUploadedFile(recipe.photo_url);
+  await removeUploadedFile(recipe.photo_url);
   return true;
 }
 
-function getUserSummary(userId) {
-  return db.prepare(`
+async function getUserSummary(userId) {
+  return await db.prepare(`
     SELECT u.*,
       (SELECT COUNT(*) FROM recipes WHERE user_id = u.id) AS recipes_count,
       (SELECT COUNT(*) FROM likes l JOIN recipes r ON r.id = l.recipe_id WHERE r.user_id = u.id) AS total_likes_received,
@@ -426,10 +419,12 @@ function getUserSummary(userId) {
   `).get(userId);
 }
 
-function initializeDatabase() {
-  db.exec(`
+async function initializeDatabase() {
+  const primaryKey = db.isPostgres ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT';
+  const timestampDefault = db.isPostgres ? 'CURRENT_TIMESTAMP::TEXT' : 'CURRENT_TIMESTAMP';
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id ${primaryKey},
       name TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
@@ -437,11 +432,11 @@ function initializeDatabase() {
       avatar_url TEXT DEFAULT '',
       is_admin INTEGER DEFAULT 0,
       is_suspended INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT DEFAULT ${timestampDefault}
     );
 
     CREATE TABLE IF NOT EXISTS recipes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id ${primaryKey},
       user_id INTEGER NOT NULL,
       title TEXT NOT NULL,
       category TEXT NOT NULL,
@@ -457,107 +452,130 @@ function initializeDatabase() {
       prep_time TEXT NOT NULL,
       servings TEXT NOT NULL,
       difficulty TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT DEFAULT ${timestampDefault},
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
     CREATE TABLE IF NOT EXISTS likes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id ${primaryKey},
       recipe_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT DEFAULT ${timestampDefault},
       UNIQUE(recipe_id, user_id),
       FOREIGN KEY (recipe_id) REFERENCES recipes(id),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
     CREATE TABLE IF NOT EXISTS favorites (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id ${primaryKey},
       recipe_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT DEFAULT ${timestampDefault},
       UNIQUE(recipe_id, user_id),
       FOREIGN KEY (recipe_id) REFERENCES recipes(id),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
     CREATE TABLE IF NOT EXISTS ratings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id ${primaryKey},
       recipe_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
       score INTEGER NOT NULL CHECK(score >=1 AND score <= 5),
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT DEFAULT ${timestampDefault},
       UNIQUE(recipe_id, user_id),
       FOREIGN KEY (recipe_id) REFERENCES recipes(id),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
     CREATE TABLE IF NOT EXISTS comments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id ${primaryKey},
       recipe_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
       parent_id INTEGER DEFAULT NULL,
       body TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT DEFAULT ${timestampDefault},
       FOREIGN KEY (recipe_id) REFERENCES recipes(id),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
     CREATE TABLE IF NOT EXISTS reports (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id ${primaryKey},
       type TEXT NOT NULL,
       item_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
       reason TEXT NOT NULL,
       status TEXT DEFAULT 'open',
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT DEFAULT ${timestampDefault}
     );
 
     CREATE TABLE IF NOT EXISTS web_sessions (
       sid TEXT PRIMARY KEY,
       sess TEXT NOT NULL,
-      expires INTEGER NOT NULL,
+      expires ${db.isPostgres ? 'BIGINT' : 'INTEGER'} NOT NULL,
       user_id INTEGER
     );
     CREATE TABLE IF NOT EXISTS seed_migrations (
       name TEXT PRIMARY KEY,
-      applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      applied_at TEXT NOT NULL DEFAULT ${timestampDefault}
     );
     CREATE INDEX IF NOT EXISTS web_sessions_expires_idx ON web_sessions(expires);
     CREATE INDEX IF NOT EXISTS comments_recipe_parent_created_idx ON comments(recipe_id, parent_id, created_at DESC, id DESC);
     CREATE INDEX IF NOT EXISTS comments_parent_created_idx ON comments(parent_id, created_at DESC, id DESC);
   `);
 
-  const userColumns = db.prepare('PRAGMA table_info(users)').all();
-  if (!userColumns.some((column) => column.name === 'is_suspended')) {
-    db.exec('ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0');
+  if (db.isPostgres) {
+    await db.exec(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE web_sessions ADD COLUMN IF NOT EXISTS user_id INTEGER;
+      ALTER TABLE web_sessions ALTER COLUMN expires TYPE BIGINT;
+      ALTER TABLE recipes ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT '';
+      ALTER TABLE recipes ADD COLUMN IF NOT EXISTS photo_credit TEXT NOT NULL DEFAULT '';
+      ALTER TABLE recipes ADD COLUMN IF NOT EXISTS photo_source_url TEXT NOT NULL DEFAULT '';
+      ALTER TABLE recipes ADD COLUMN IF NOT EXISTS photo_license TEXT NOT NULL DEFAULT '';
+      ALTER TABLE recipes ADD COLUMN IF NOT EXISTS photo_illustrative INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE recipes ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE likes ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE favorites ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE ratings ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE comments ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE web_sessions ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE seed_migrations ENABLE ROW LEVEL SECURITY;
+      CREATE INDEX IF NOT EXISTS recipes_state_idx ON recipes(state);
+    `);
+  } else {
+    const userColumns = await db.prepare('PRAGMA table_info(users)').all();
+    if (!userColumns.some((column) => column.name === 'is_suspended')) {
+      await db.exec('ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0');
+    }
+    const sessionColumns = await db.prepare('PRAGMA table_info(web_sessions)').all();
+    if (!sessionColumns.some((column) => column.name === 'user_id')) {
+      await db.exec('ALTER TABLE web_sessions ADD COLUMN user_id INTEGER');
+    }
+    const recipeColumns = await db.prepare('PRAGMA table_info(recipes)').all();
+    if (!recipeColumns.some((column) => column.name === 'state')) {
+      await db.exec("ALTER TABLE recipes ADD COLUMN state TEXT NOT NULL DEFAULT ''");
+    }
+    const photoColumns = new Set((await db.prepare('PRAGMA table_info(recipes)').all()).map((column) => column.name));
+    const missingPhotoColumns = [
+      ['photo_credit', "TEXT NOT NULL DEFAULT ''"],
+      ['photo_source_url', "TEXT NOT NULL DEFAULT ''"],
+      ['photo_license', "TEXT NOT NULL DEFAULT ''"],
+      ['photo_illustrative', 'INTEGER NOT NULL DEFAULT 0']
+    ];
+    for (const [column, definition] of missingPhotoColumns) {
+      if (!photoColumns.has(column)) await db.exec(`ALTER TABLE recipes ADD COLUMN ${column} ${definition}`);
+    }
+    await db.exec('CREATE INDEX IF NOT EXISTS recipes_state_idx ON recipes(state)');
   }
-  const sessionColumns = db.prepare('PRAGMA table_info(web_sessions)').all();
-  if (!sessionColumns.some((column) => column.name === 'user_id')) {
-    db.exec('ALTER TABLE web_sessions ADD COLUMN user_id INTEGER');
-  }
-  const recipeColumns = db.prepare('PRAGMA table_info(recipes)').all();
-  if (!recipeColumns.some((column) => column.name === 'state')) {
-    db.exec("ALTER TABLE recipes ADD COLUMN state TEXT NOT NULL DEFAULT ''");
-  }
-  const photoColumns = new Set(db.prepare('PRAGMA table_info(recipes)').all().map((column) => column.name));
-  const missingPhotoColumns = [
-    ['photo_credit', "TEXT NOT NULL DEFAULT ''"],
-    ['photo_source_url', "TEXT NOT NULL DEFAULT ''"],
-    ['photo_license', "TEXT NOT NULL DEFAULT ''"],
-    ['photo_illustrative', 'INTEGER NOT NULL DEFAULT 0']
-  ];
-  for (const [column, definition] of missingPhotoColumns) {
-    if (!photoColumns.has(column)) db.exec(`ALTER TABLE recipes ADD COLUMN ${column} ${definition}`);
-  }
-  db.exec('CREATE INDEX IF NOT EXISTS recipes_state_idx ON recipes(state)');
 
   const adminEmail = (process.env.ADMIN_EMAIL || 'receitaadmin@sdetodos.com').trim().toLowerCase();
   const adminPassword = process.env.ADMIN_PASSWORD || crypto.randomBytes(24).toString('base64url');
-  const existingAdmin = db.prepare('SELECT id, password_hash FROM users WHERE email = ?').get(adminEmail);
+  const existingAdmin = await db.prepare('SELECT id, password_hash FROM users WHERE email = ?').get(adminEmail);
   if (!existingAdmin) {
     const adminHash = bcrypt.hashSync(adminPassword, 10);
-    const inserted = db.prepare(`
+    const inserted = await db.prepare(`
       INSERT INTO users (name, email, password_hash, bio, avatar_url, is_admin)
       VALUES (?, ?, ?, ?, ?, 1)
     `).run('Admin Receitas', adminEmail, adminHash, 'Moderador da comunidade de culinária.', '/images/default-avatar.svg');
@@ -606,7 +624,7 @@ function initializeDatabase() {
     ];
 
     for (const recipe of recipesSeed) {
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO recipes (user_id, title, category, description, photo_url, ingredients_json, steps_json, prep_time, servings, difficulty)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -625,21 +643,21 @@ function initializeDatabase() {
   } else if (process.env.ADMIN_PASSWORD) {
     if (!bcrypt.compareSync(adminPassword, existingAdmin.password_hash)) {
       const adminHash = bcrypt.hashSync(adminPassword, 10);
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(adminHash, existingAdmin.id);
-      db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(existingAdmin.id);
+      await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(adminHash, existingAdmin.id);
+      await db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(existingAdmin.id);
     }
-    db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(existingAdmin.id);
+    await db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(existingAdmin.id);
   } else if (!isProduction && bcrypt.compareSync('admin123', existingAdmin.password_hash)) {
     const newAdminPassword = crypto.randomBytes(24).toString('base64url');
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newAdminPassword, 10), existingAdmin.id);
-    db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(existingAdmin.id);
+    await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newAdminPassword, 10), existingAdmin.id);
+    await db.prepare('DELETE FROM web_sessions WHERE user_id = ?').run(existingAdmin.id);
     console.warn(`A senha administrativa padrÃ£o foi substituÃ­da. Nova senha (guarde-a): ${newAdminPassword}`);
   }
 
   const regionalSeedName = 'regional-recipes-810-v1';
-  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(regionalSeedName)) {
+  if (!await db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(regionalSeedName)) {
     const regionalRecipes = require('./seed-data/regional-recipes');
-    const seedOwner = db.prepare('SELECT id FROM users WHERE email = ?').get(adminEmail);
+    const seedOwner = await db.prepare('SELECT id FROM users WHERE email = ?').get(adminEmail);
     if (!seedOwner || regionalRecipes.length !== 810) {
       throw new Error('O catálogo regional precisa conter 810 receitas e uma conta administradora.');
     }
@@ -647,94 +665,96 @@ function initializeDatabase() {
       INSERT INTO recipes (user_id, title, category, state, description, photo_url, photo_credit, photo_source_url, photo_license, photo_illustrative, ingredients_json, steps_json, prep_time, servings, difficulty)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    db.transaction(() => {
+    await db.transaction(async () => {
       for (const recipe of regionalRecipes) {
-        insertRegionalRecipe.run(
+        await insertRegionalRecipe.run(
           seedOwner.id, recipe.title, recipe.category, recipe.state, recipe.description, recipe.photo_url,
           recipe.photo_credit, recipe.photo_source_url, recipe.photo_license, recipe.photo_illustrative,
           JSON.stringify(recipe.ingredients), JSON.stringify(recipe.steps), recipe.prep_time,
           recipe.servings, recipe.difficulty
         );
       }
-      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(regionalSeedName);
+      await db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(regionalSeedName);
     })();
   }
 
   const imageMigrationName = 'regional-recipe-images-v2';
-  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(imageMigrationName)) {
+  if (!await db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(imageMigrationName)) {
     const regionalRecipes = require('./seed-data/regional-recipes');
     const updateRecipeImage = db.prepare(`
       UPDATE recipes
       SET photo_url = ?, photo_credit = ?, photo_source_url = ?, photo_license = ?, photo_illustrative = ?
       WHERE state = ? AND title = ?
     `);
-    db.transaction(() => {
+    await db.transaction(async () => {
       for (const recipe of regionalRecipes) {
-        updateRecipeImage.run(
+        await updateRecipeImage.run(
           recipe.photo_url, recipe.photo_credit, recipe.photo_source_url, recipe.photo_license,
           recipe.photo_illustrative, recipe.state, recipe.title
         );
       }
-      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(imageMigrationName);
+      await db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(imageMigrationName);
     })();
   }
 
   const verifiedRecipePhotoMigration = 'regional-recipe-photos-clear-v1';
-  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(verifiedRecipePhotoMigration)) {
+  if (!await db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(verifiedRecipePhotoMigration)) {
     const regionalRecipes = require('./seed-data/regional-recipes');
     const clearRecipePhoto = db.prepare(`
       UPDATE recipes
       SET photo_url = '', photo_credit = '', photo_source_url = '', photo_license = '', photo_illustrative = 0
       WHERE state = ? AND title = ?
     `);
-    db.transaction(() => {
-      for (const recipe of regionalRecipes) clearRecipePhoto.run(recipe.state, recipe.title);
-      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(verifiedRecipePhotoMigration);
+    await db.transaction(async () => {
+      for (const recipe of regionalRecipes) await clearRecipePhoto.run(recipe.state, recipe.title);
+      await db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(verifiedRecipePhotoMigration);
     })();
   }
 
   const exactRecipePhotoMigration = 'regional-recipe-photos-exact-v1';
-  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(exactRecipePhotoMigration)) {
+  if (!await db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(exactRecipePhotoMigration)) {
     const regionalRecipes = require('./seed-data/regional-recipes');
     const updateVerifiedRecipePhoto = db.prepare(`
       UPDATE recipes
       SET photo_url = ?, photo_credit = ?, photo_source_url = ?, photo_license = ?, photo_illustrative = 0
       WHERE state = ? AND title = ?
     `);
-    db.transaction(() => {
+    await db.transaction(async () => {
       for (const recipe of regionalRecipes) {
-        updateVerifiedRecipePhoto.run(
+        await updateVerifiedRecipePhoto.run(
           recipe.photo_url, recipe.photo_credit, recipe.photo_source_url, recipe.photo_license,
           recipe.state, recipe.title
         );
       }
-      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(exactRecipePhotoMigration);
+      await db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(exactRecipePhotoMigration);
     })();
   }
 
   const regionalRecipeDraftLabelMigration = 'regional-recipe-draft-label-v1';
-  if (!db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(regionalRecipeDraftLabelMigration)) {
+  if (!await db.prepare('SELECT 1 FROM seed_migrations WHERE name = ?').get(regionalRecipeDraftLabelMigration)) {
     const regionalRecipes = require('./seed-data/regional-recipes');
     const updateDraftDescription = db.prepare(`
       UPDATE recipes SET description = ?
       WHERE state = ? AND title = ? AND description LIKE 'Versão caseira de %'
     `);
-    db.transaction(() => {
+    await db.transaction(async () => {
       for (const recipe of regionalRecipes) {
-        updateDraftDescription.run(recipe.description, recipe.state, recipe.title);
+        await updateDraftDescription.run(recipe.description, recipe.state, recipe.title);
       }
-      db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(regionalRecipeDraftLabelMigration);
+      await db.prepare('INSERT INTO seed_migrations (name) VALUES (?)').run(regionalRecipeDraftLabelMigration);
     })();
   }
 
   if (isProduction && adminEmail !== 'admin@receitasdetodos.com') {
-    db.prepare('UPDATE users SET is_admin = 0 WHERE email = ?').run('admin@receitasdetodos.com');
+    await db.prepare('UPDATE users SET is_admin = 0 WHERE email = ?').run('admin@receitasdetodos.com');
   }
 }
 
-initializeDatabase();
-db.exec('DROP TABLE IF EXISTS password_resets');
-db.pragma('journal_mode = WAL');
+async function prepareDatabase() {
+  if (db.isPostgres) await db.prepare('SELECT 1').get();
+  await initializeDatabase();
+  await db.exec('DROP TABLE IF EXISTS password_resets');
+}
 
 app.disable('x-powered-by');
 app.use((req, res, next) => {
@@ -747,12 +767,14 @@ app.use((req, res, next) => {
 });
 app.use(express.urlencoded({ extended: true, limit: '64kb', parameterLimit: 200 }));
 app.use(express.json({ limit: '32kb' }));
-app.use('/uploads', express.static(uploadDir, { dotfiles: 'deny', index: false }));
+if (!cloudStorageEnabled) app.use('/uploads', express.static(uploadDir, { dotfiles: 'deny', index: false }));
 app.use(express.static(path.join(__dirname, 'public')));
 if (isProduction) app.set('trust proxy', 1);
-const sessionStore = new SqliteSessionStore(db);
+const sessionStore = new DatabaseSessionStore(db);
 const cleanupSessions = setInterval(() => {
-  sessionStore.deleteExpired.run(Date.now());
+  Promise.resolve().then(() => sessionStore.deleteExpired.run(Date.now())).catch((error) => {
+    console.error('Não foi possível remover sessões expiradas.', error);
+  });
 }, 60 * 60 * 1000);
 cleanupSessions.unref();
 app.use(session({
@@ -766,6 +788,11 @@ app.use(session({
 
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
+
+app.get('/health', async (_req, res) => {
+  await db.prepare('SELECT 1').get();
+  res.status(200).type('text/plain').send('ok');
+});
 
 app.use((req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
@@ -795,12 +822,12 @@ app.use((req, res, next) => {
   next();
 });
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   if (!req.session.user) {
     setFlash(req, 'Faça login para continuar.', 'warning');
     return res.redirect('/login');
   }
-  const user = db.prepare('SELECT is_suspended, is_admin FROM users WHERE id = ?').get(req.session.user.id);
+  const user = await db.prepare('SELECT is_suspended, is_admin FROM users WHERE id = ?').get(req.session.user.id);
   if (!user || user.is_suspended) {
     req.session.user = null;
     setFlash(req, 'Esta conta não está disponível. Se precisar de ajuda, fale com a administração.', 'danger');
@@ -810,9 +837,9 @@ function requireAuth(req, res, next) {
   next();
 }
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
   const user = req.session.user
-    ? db.prepare('SELECT is_admin, is_suspended FROM users WHERE id = ?').get(req.session.user.id)
+    ? await db.prepare('SELECT is_admin, is_suspended FROM users WHERE id = ?').get(req.session.user.id)
     : null;
   if (!user || !user.is_admin || user.is_suspended) {
     if (req.session.user) req.session.user.is_admin = false;
@@ -823,8 +850,8 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function requireRecipeEditAccess(req, res, next) {
-  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+async function requireRecipeEditAccess(req, res, next) {
+  const recipe = await db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
   if (!recipe) {
     setFlash(req, 'Receita nÃ£o encontrada.', 'warning');
     return res.redirect('/recipes');
@@ -856,15 +883,15 @@ function establishSession(req, res, user, message, redirectTo, next) {
   });
 }
 
-function renderHomePage(req, res) {
+async function renderHomePage(req, res) {
   const pageSize = 20;
-  const totalRecipes = db.prepare('SELECT COUNT(*) AS total FROM recipes').get().total;
+  const totalRecipes = (await db.prepare('SELECT COUNT(*) AS total FROM recipes').get()).total;
   const pageCount = Math.max(1, Math.ceil(totalRecipes / pageSize));
   const requestedPage = typeof req.query.page === 'string' ? Number(req.query.page) : 1;
   const page = Number.isSafeInteger(requestedPage) && requestedPage > 0
     ? Math.min(requestedPage, pageCount)
     : 1;
-  const recipes = getRecipeSummary({ limit: pageSize, offset: (page - 1) * pageSize });
+  const recipes = await getRecipeSummary({ limit: pageSize, offset: (page - 1) * pageSize });
 
   res.render('home', {
     recipes,
@@ -878,11 +905,11 @@ function renderHomePage(req, res) {
   });
 }
 
-app.get('/', (req, res) => {
-  renderHomePage(req, res);
+app.get('/', async (req, res) => {
+  await renderHomePage(req, res);
 });
 
-app.get('/recipes', (req, res) => {
+app.get('/recipes', async (req, res) => {
   const search = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
   const category = typeof req.query.category === 'string' ? req.query.category.trim() : '';
   const requestedState = typeof req.query.state === 'string' ? req.query.state.trim().toUpperCase() : '';
@@ -894,7 +921,7 @@ app.get('/recipes', (req, res) => {
   const requestedPage = typeof req.query.page === 'string' ? Number(req.query.page) : 1;
   const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? Math.min(requestedPage, 10000) : 1;
   const pageSize = 24;
-  const pageRecipes = getRecipeSummary({ search, category, state, difficulty, maxPrepTime, sort, limit: pageSize + 1, offset: (page - 1) * pageSize });
+  const pageRecipes = await getRecipeSummary({ search, category, state, difficulty, maxPrepTime, sort, limit: pageSize + 1, offset: (page - 1) * pageSize });
   const hasNextPage = pageRecipes.length > pageSize;
   const recipes = pageRecipes.slice(0, pageSize);
   const filterQuery = new URLSearchParams({ q: search, category, state, difficulty, max_time: String(maxPrepTime || ''), sort }).toString();
@@ -915,8 +942,8 @@ app.get('/recipes', (req, res) => {
   });
 });
 
-app.get('/recipe/:id', (req, res) => {
-  const recipe = getRecipeDetail(req.params.id);
+app.get('/recipe/:id', async (req, res) => {
+  const recipe = await getRecipeDetail(req.params.id);
   if (!recipe) {
     setFlash(req, 'Receita não encontrada.', 'warning');
     return res.redirect('/recipes');
@@ -925,13 +952,13 @@ app.get('/recipe/:id', (req, res) => {
   const ingredients = safeJsonArray(recipe.ingredients_json);
   const steps = safeJsonArray(recipe.steps_json);
   const commentPageSize = 25;
-  const totalTopLevelComments = db.prepare('SELECT COUNT(*) AS total FROM comments WHERE recipe_id = ? AND parent_id IS NULL').get(recipe.id).total;
+  const totalTopLevelComments = (await db.prepare('SELECT COUNT(*) AS total FROM comments WHERE recipe_id = ? AND parent_id IS NULL').get(recipe.id)).total;
   const requestedCommentPage = typeof req.query.comments_page === 'string' ? Number(req.query.comments_page) : 1;
   const commentPageCount = Math.max(1, Math.ceil(totalTopLevelComments / commentPageSize));
   const commentPage = Number.isSafeInteger(requestedCommentPage) && requestedCommentPage > 0
     ? Math.min(requestedCommentPage, commentPageCount)
     : 1;
-  const topLevelComments = db.prepare(`
+  const topLevelComments = await db.prepare(`
     SELECT c.*, u.name AS author_name, u.avatar_url AS author_avatar
     FROM comments c
     JOIN users u ON u.id = c.user_id
@@ -948,21 +975,21 @@ app.get('/recipe/:id', (req, res) => {
     LIMIT 20
   `);
   for (const comment of topLevelComments) {
-    comment.replies = getRecentReplies.all(comment.id).reverse();
+    comment.replies = (await getRecentReplies.all(comment.id)).reverse();
   }
   const hasOlderComments = commentPage < commentPageCount;
   const hasNewerComments = commentPage > 1;
 
   const hasLiked = req.session.user
-    ? db.prepare('SELECT 1 FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
+    ? await db.prepare('SELECT 1 FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
     : null;
 
   const hasFavorited = req.session.user
-    ? db.prepare('SELECT 1 FROM favorites WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
+    ? await db.prepare('SELECT 1 FROM favorites WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
     : null;
 
   const userRating = req.session.user
-    ? db.prepare('SELECT score FROM ratings WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
+    ? await db.prepare('SELECT score FROM ratings WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
     : null;
 
   const isOwner = req.session.user && req.session.user.id === recipe.user_id;
@@ -985,8 +1012,8 @@ app.get('/recipe/:id', (req, res) => {
   });
 });
 
-app.get('/recipe/:id/edit', requireAuth, (req, res) => {
-  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+app.get('/recipe/:id/edit', requireAuth, async (req, res) => {
+  const recipe = await db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
   if (!recipe) {
     return res.redirect('/recipes');
   }
@@ -1005,7 +1032,7 @@ app.get('/recipe/:id/edit', requireAuth, (req, res) => {
   });
 });
 
-app.post('/recipe/:id/edit', requireAuth, requireRecipeEditAccess, writeLimiter, uploadLimiter, upload.single('photo'), verifyUploadedImage, (req, res) => {
+app.post('/recipe/:id/edit', requireAuth, requireRecipeEditAccess, writeLimiter, uploadLimiter, upload.single('photo'), verifyUploadedImage, async (req, res) => {
   const recipe = req.recipe;
   if (!recipe) {
     return res.redirect('/recipes');
@@ -1017,27 +1044,31 @@ app.post('/recipe/:id/edit', requireAuth, requireRecipeEditAccess, writeLimiter,
 
   const parsed = parseRecipeForm(req.body);
   if (parsed.error) {
-    if (req.file) fs.unlinkSync(req.file.path);
     setFlash(req, parsed.error, 'warning');
     return res.redirect(`/recipe/${recipe.id}/edit`);
   }
 
   const fields = parsed.value;
-  const photoUrl = req.file ? `/uploads/${req.file.filename}` : (fields.photoUrl || recipe.photo_url || '');
+  const photoUrl = req.file ? await storeUploadedImage(req.file) : (fields.photoUrl || recipe.photo_url || '');
 
-  db.prepare(`
-    UPDATE recipes
-    SET title = ?, category = ?, state = ?, description = ?, photo_url = ?, ingredients_json = ?, steps_json = ?, prep_time = ?, servings = ?, difficulty = ?
-    WHERE id = ?
-  `).run(fields.title, fields.category, fields.state, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty, recipe.id);
-  if (recipe.photo_url !== photoUrl) removeUploadedFile(recipe.photo_url);
+  try {
+    await db.prepare(`
+      UPDATE recipes
+      SET title = ?, category = ?, state = ?, description = ?, photo_url = ?, ingredients_json = ?, steps_json = ?, prep_time = ?, servings = ?, difficulty = ?
+      WHERE id = ?
+    `).run(fields.title, fields.category, fields.state, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty, recipe.id);
+  } catch (error) {
+    if (req.file) await removeUploadedFile(photoUrl);
+    throw error;
+  }
+  if (recipe.photo_url !== photoUrl) await removeUploadedFile(recipe.photo_url);
 
   setFlash(req, 'Receita atualizada com sucesso!', 'success');
   res.redirect(`/recipe/${recipe.id}`);
 });
 
-app.post('/recipe/:id/delete', requireAuth, writeLimiter, (req, res) => {
-  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+app.post('/recipe/:id/delete', requireAuth, writeLimiter, async (req, res) => {
+  const recipe = await db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
   if (!recipe) {
     return res.redirect('/recipes');
   }
@@ -1046,39 +1077,39 @@ app.post('/recipe/:id/delete', requireAuth, writeLimiter, (req, res) => {
     return res.redirect(`/recipe/${recipe.id}`);
   }
 
-  removeRecipe(recipe.id);
+  await removeRecipe(recipe.id);
 
   setFlash(req, 'Receita removida com sucesso.', 'success');
   return res.redirect('/profile');
 });
 
-app.post('/recipe/:id/like', requireAuth, writeLimiter, (req, res) => {
+app.post('/recipe/:id/like', requireAuth, writeLimiter, async (req, res) => {
   const recipeId = Number(req.params.id);
-  const existing = db.prepare('SELECT id FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
+  const existing = await db.prepare('SELECT id FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
 
   if (existing) {
-    db.prepare('DELETE FROM likes WHERE id = ?').run(existing.id);
+    await db.prepare('DELETE FROM likes WHERE id = ?').run(existing.id);
   } else {
-    db.prepare('INSERT INTO likes (recipe_id, user_id) VALUES (?, ?)').run(recipeId, req.session.user.id);
+    await db.prepare('INSERT INTO likes (recipe_id, user_id) VALUES (?, ?)').run(recipeId, req.session.user.id);
   }
 
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/favorite', requireAuth, writeLimiter, (req, res) => {
+app.post('/recipe/:id/favorite', requireAuth, writeLimiter, async (req, res) => {
   const recipeId = Number(req.params.id);
-  const existing = db.prepare('SELECT id FROM favorites WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
+  const existing = await db.prepare('SELECT id FROM favorites WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
 
   if (existing) {
-    db.prepare('DELETE FROM favorites WHERE id = ?').run(existing.id);
+    await db.prepare('DELETE FROM favorites WHERE id = ?').run(existing.id);
   } else {
-    db.prepare('INSERT INTO favorites (recipe_id, user_id) VALUES (?, ?)').run(recipeId, req.session.user.id);
+    await db.prepare('INSERT INTO favorites (recipe_id, user_id) VALUES (?, ?)').run(recipeId, req.session.user.id);
   }
 
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/rate', requireAuth, writeLimiter, (req, res) => {
+app.post('/recipe/:id/rate', requireAuth, writeLimiter, async (req, res) => {
   const recipeId = Number(req.params.id);
   const score = Number(req.body.score || 0);
 
@@ -1087,18 +1118,18 @@ app.post('/recipe/:id/rate', requireAuth, writeLimiter, (req, res) => {
     return res.redirect(`/recipe/${recipeId}`);
   }
 
-  const existing = db.prepare('SELECT id FROM ratings WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
+  const existing = await db.prepare('SELECT id FROM ratings WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
   if (existing) {
-    db.prepare('UPDATE ratings SET score = ? WHERE id = ?').run(score, existing.id);
+    await db.prepare('UPDATE ratings SET score = ? WHERE id = ?').run(score, existing.id);
   } else {
-    db.prepare('INSERT INTO ratings (recipe_id, user_id, score) VALUES (?, ?, ?)').run(recipeId, req.session.user.id, score);
+    await db.prepare('INSERT INTO ratings (recipe_id, user_id, score) VALUES (?, ?, ?)').run(recipeId, req.session.user.id, score);
   }
 
   setFlash(req, 'Sua avaliação foi registrada.', 'success');
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/comment', requireAuth, writeLimiter, (req, res) => {
+app.post('/recipe/:id/comment', requireAuth, writeLimiter, async (req, res) => {
   const recipeId = Number(req.params.id);
   const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
   const parentId = req.body.parent_id ? Number(req.body.parent_id) : null;
@@ -1108,29 +1139,29 @@ app.post('/recipe/:id/comment', requireAuth, writeLimiter, (req, res) => {
     return res.redirect(`/recipe/${recipeId}`);
   }
 
-  if (!db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId)) {
+  if (!await db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId)) {
     setFlash(req, 'Receita não encontrada.', 'warning');
     return res.redirect('/recipes');
   }
 
   if (parentId) {
-    const parent = db.prepare('SELECT id FROM comments WHERE id = ? AND recipe_id = ? AND parent_id IS NULL').get(parentId, recipeId);
+    const parent = await db.prepare('SELECT id FROM comments WHERE id = ? AND recipe_id = ? AND parent_id IS NULL').get(parentId, recipeId);
     if (!parent) {
       setFlash(req, 'Não foi possível responder a esse comentário.', 'warning');
       return res.redirect(`/recipe/${recipeId}`);
     }
   }
 
-  db.prepare('INSERT INTO comments (recipe_id, user_id, parent_id, body) VALUES (?, ?, ?, ?)').run(recipeId, req.session.user.id, parentId, body);
+  await db.prepare('INSERT INTO comments (recipe_id, user_id, parent_id, body) VALUES (?, ?, ?, ?)').run(recipeId, req.session.user.id, parentId, body);
   setFlash(req, 'Comentário enviado.', 'success');
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/recipe/:id/report', requireAuth, writeLimiter, (req, res) => {
+app.post('/recipe/:id/report', requireAuth, writeLimiter, async (req, res) => {
   const recipeId = Number(req.params.id);
   const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
 
-  if (!db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId)) {
+  if (!await db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId)) {
     setFlash(req, 'Receita não encontrada.', 'warning');
     return res.redirect('/recipes');
   }
@@ -1139,15 +1170,15 @@ app.post('/recipe/:id/report', requireAuth, writeLimiter, (req, res) => {
     return res.redirect(`/recipe/${recipeId}`);
   }
 
-  const duplicate = db.prepare("SELECT id FROM reports WHERE type = 'recipe' AND item_id = ? AND user_id = ? AND status = 'open'").get(recipeId, req.session.user.id);
-  if (!duplicate) db.prepare('INSERT INTO reports (type, item_id, user_id, reason) VALUES (?, ?, ?, ?)').run('recipe', recipeId, req.session.user.id, reason);
+  const duplicate = await db.prepare("SELECT id FROM reports WHERE type = 'recipe' AND item_id = ? AND user_id = ? AND status = 'open'").get(recipeId, req.session.user.id);
+  if (!duplicate) await db.prepare('INSERT INTO reports (type, item_id, user_id, reason) VALUES (?, ?, ?, ?)').run('recipe', recipeId, req.session.user.id, reason);
   setFlash(req, 'Denúncia registrada. A equipe de moderação será avisada.', 'success');
   res.redirect(`/recipe/${recipeId}`);
 });
 
-app.post('/comment/:id/report', requireAuth, writeLimiter, (req, res) => {
+app.post('/comment/:id/report', requireAuth, writeLimiter, async (req, res) => {
   const commentId = Number(req.params.id);
-  const comment = db.prepare('SELECT id, recipe_id FROM comments WHERE id = ?').get(commentId);
+  const comment = await db.prepare('SELECT id, recipe_id FROM comments WHERE id = ?').get(commentId);
   if (!comment) {
     setFlash(req, 'Comentário não encontrado.', 'warning');
     return res.redirect('/recipes');
@@ -1159,8 +1190,8 @@ app.post('/comment/:id/report', requireAuth, writeLimiter, (req, res) => {
     return res.redirect(`/recipe/${comment.recipe_id}`);
   }
 
-  const duplicate = db.prepare("SELECT id FROM reports WHERE type = 'comment' AND item_id = ? AND user_id = ? AND status = 'open'").get(commentId, req.session.user.id);
-  if (!duplicate) db.prepare('INSERT INTO reports (type, item_id, user_id, reason) VALUES (?, ?, ?, ?)').run('comment', commentId, req.session.user.id, reason);
+  const duplicate = await db.prepare("SELECT id FROM reports WHERE type = 'comment' AND item_id = ? AND user_id = ? AND status = 'open'").get(commentId, req.session.user.id);
+  if (!duplicate) await db.prepare('INSERT INTO reports (type, item_id, user_id, reason) VALUES (?, ?, ?, ?)').run('comment', commentId, req.session.user.id, reason);
   setFlash(req, 'Denúncia registrada para análise da moderação.', 'success');
   res.redirect(`/recipe/${comment.recipe_id}`);
 });
@@ -1170,11 +1201,11 @@ app.get('/login', (req, res) => {
   res.render('login', { pageTitle: 'Login' });
 });
 
-app.post('/login', loginLimiter, (req, res) => {
+app.post('/login', loginLimiter, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
   const password = typeof body.password === 'string' ? body.password : '';
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const user = await db.prepare('SELECT * FROM users WHERE email = ?').get(email);
 
   if (!user || user.is_suspended || Buffer.byteLength(password, 'utf8') > 72 || !bcrypt.compareSync(password, user.password_hash)) {
     setFlash(req, 'E-mail ou senha inválidos.', 'danger');
@@ -1201,7 +1232,7 @@ function renderRegistrationError(req, res, message, formData, status = 400) {
   });
 }
 
-app.post('/register', registrationLimiter, (req, res) => {
+app.post('/register', registrationLimiter, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
@@ -1213,7 +1244,7 @@ app.post('/register', registrationLimiter, (req, res) => {
     return renderRegistrationError(req, res, 'Confira os dados. A senha deve ter pelo menos 7 caracteres.', formData);
   }
 
-  const existing = db.prepare(`
+  const existing = await db.prepare(`
     SELECT id, email FROM users
     WHERE lower(email) = ?
       OR lower(email) LIKE '%@gmail.com'
@@ -1226,8 +1257,8 @@ app.post('/register', registrationLimiter, (req, res) => {
   const passwordHash = bcrypt.hashSync(password, 10);
   let result;
   try {
-    result = db.transaction(() => {
-      const possibleDuplicates = db.prepare(`
+    result = await db.transaction(async () => {
+      const possibleDuplicates = await db.prepare(`
         SELECT email FROM users
         WHERE lower(email) = ?
           OR lower(email) LIKE '%@gmail.com'
@@ -1235,11 +1266,11 @@ app.post('/register', registrationLimiter, (req, res) => {
       `).all(email);
       const normalizedEmail = normalizeEmailForDuplicateCheck(email);
       if (possibleDuplicates.some((user) => normalizeEmailForDuplicateCheck(user.email) === normalizedEmail)) return null;
-      return db.prepare('INSERT INTO users (name, email, password_hash, avatar_url) VALUES (?, ?, ?, ?)')
+      return await db.prepare('INSERT INTO users (name, email, password_hash, avatar_url) VALUES (?, ?, ?, ?)')
         .run(name, email, passwordHash, '/images/default-avatar.svg');
-    }).immediate();
+    })();
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE' || error.code === '23505') {
       return renderRegistrationError(req, res, 'Esse e-mail já está cadastrado. Entre na sua conta ou use outro e-mail.', formData);
     }
     console.error('Não foi possível criar a conta.', error);
@@ -1270,9 +1301,9 @@ app.post('/logout', (req, res, next) => {
   });
 });
 
-app.get('/profile', requireAuth, (req, res) => {
-  const userData = getUserSummary(req.session.user.id);
-  const recipes = db.prepare(`
+app.get('/profile', requireAuth, async (req, res) => {
+  const userData = await getUserSummary(req.session.user.id);
+  const recipes = await db.prepare(`
     SELECT r.*, (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
            COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
     FROM recipes r
@@ -1280,7 +1311,7 @@ app.get('/profile', requireAuth, (req, res) => {
     ORDER BY r.created_at DESC
   `).all(req.session.user.id);
 
-  const favorites = db.prepare(`
+  const favorites = await db.prepare(`
     SELECT r.*, u.name AS author_name,
            (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
            COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
@@ -1294,12 +1325,12 @@ app.get('/profile', requireAuth, (req, res) => {
   res.render('profile', { userData, recipes, favorites, isOwnProfile: true, pageTitle: 'Meu perfil', metaDescription: `Perfil de ${userData.name} na comunidade Receitas de Todos.` });
 });
 
-app.get('/profile/edit', requireAuth, (req, res) => {
-  const userData = getUserSummary(req.session.user.id);
+app.get('/profile/edit', requireAuth, async (req, res) => {
+  const userData = await getUserSummary(req.session.user.id);
   res.render('profile-edit', { userData, pageTitle: 'Editar perfil' });
 });
 
-app.post('/profile/edit', requireAuth, writeLimiter, uploadLimiter, upload.single('avatar'), verifyUploadedImage, (req, res, next) => {
+app.post('/profile/edit', requireAuth, writeLimiter, uploadLimiter, upload.single('avatar'), verifyUploadedImage, async (req, res, next) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const bio = typeof body.bio === 'string' ? body.bio.trim() : '';
@@ -1307,19 +1338,23 @@ app.post('/profile/edit', requireAuth, writeLimiter, uploadLimiter, upload.singl
 
   if (name.length < 2 || name.length > 80 || bio.length > 500 ||
       avatarUrl.length > 2000 || !isSafeImageUrl(avatarUrl)) {
-    if (req.file) fs.unlinkSync(req.file.path);
     setFlash(req, 'Confira o nome, a biografia e a URL da foto.', 'warning');
     return res.redirect('/profile/edit');
   }
 
   const previousAvatar = req.session.user.avatar_url;
-  const nextAvatar = req.file ? `/uploads/${req.file.filename}` : (avatarUrl || previousAvatar || '/images/default-avatar.svg');
-  db.prepare('UPDATE users SET name = ?, bio = ?, avatar_url = ? WHERE id = ?')
-    .run(name, bio, nextAvatar, req.session.user.id);
+  const nextAvatar = req.file ? await storeUploadedImage(req.file) : (avatarUrl || previousAvatar || '/images/default-avatar.svg');
+  try {
+    await db.prepare('UPDATE users SET name = ?, bio = ?, avatar_url = ? WHERE id = ?')
+      .run(name, bio, nextAvatar, req.session.user.id);
+  } catch (error) {
+    if (req.file) await removeUploadedFile(nextAvatar);
+    throw error;
+  }
   req.session.user.name = name;
   req.session.user.bio = bio;
   req.session.user.avatar_url = nextAvatar;
-  if (previousAvatar !== nextAvatar) removeUploadedFile(previousAvatar);
+  if (previousAvatar !== nextAvatar) await removeUploadedFile(previousAvatar);
   setFlash(req, 'Perfil atualizado.', 'success');
   req.session.save((error) => {
     if (error) return next(error);
@@ -1327,14 +1362,14 @@ app.post('/profile/edit', requireAuth, writeLimiter, uploadLimiter, upload.singl
   });
 });
 
-app.get('/profile/:id', (req, res) => {
-  const userData = getUserSummary(req.params.id);
+app.get('/profile/:id', async (req, res) => {
+  const userData = await getUserSummary(req.params.id);
   if (!userData) {
     setFlash(req, 'Perfil não encontrado.', 'warning');
     return res.redirect('/recipes');
   }
 
-  const recipes = db.prepare(`
+  const recipes = await db.prepare(`
     SELECT r.*, (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
            COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
     FROM recipes r
@@ -1343,7 +1378,7 @@ app.get('/profile/:id', (req, res) => {
   `).all(userData.id);
 
   const canViewFavorites = req.session.user && req.session.user.id === userData.id;
-  const favorites = canViewFavorites ? db.prepare(`
+  const favorites = canViewFavorites ? await db.prepare(`
     SELECT r.*, u.name AS author_name,
            (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
            COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
@@ -1361,28 +1396,33 @@ app.get('/new-recipe', requireAuth, (req, res) => {
   res.render('recipe-form', { mode: 'create', recipe: null, pageTitle: 'Nova receita' });
 });
 
-app.post('/new-recipe', requireAuth, writeLimiter, uploadLimiter, upload.single('photo'), verifyUploadedImage, (req, res) => {
+app.post('/new-recipe', requireAuth, writeLimiter, uploadLimiter, upload.single('photo'), verifyUploadedImage, async (req, res) => {
   const parsed = parseRecipeForm(req.body);
   if (parsed.error) {
-    if (req.file) fs.unlinkSync(req.file.path);
     setFlash(req, parsed.error, 'warning');
     return res.redirect('/new-recipe');
   }
 
   const fields = parsed.value;
-  const photoUrl = req.file ? `/uploads/${req.file.filename}` : (fields.photoUrl || '');
+  const photoUrl = req.file ? await storeUploadedImage(req.file) : (fields.photoUrl || '');
 
-  const result = db.prepare(`
-    INSERT INTO recipes (user_id, title, category, state, description, photo_url, ingredients_json, steps_json, prep_time, servings, difficulty)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(req.session.user.id, fields.title, fields.category, fields.state, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty);
+  let result;
+  try {
+    result = await db.prepare(`
+      INSERT INTO recipes (user_id, title, category, state, description, photo_url, ingredients_json, steps_json, prep_time, servings, difficulty)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(req.session.user.id, fields.title, fields.category, fields.state, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty);
+  } catch (error) {
+    if (req.file) await removeUploadedFile(photoUrl);
+    throw error;
+  }
 
   setFlash(req, 'Receita publicada com sucesso!', 'success');
   res.redirect(`/recipe/${result.lastInsertRowid}`);
 });
 
-app.get('/admin', requireAdmin, (req, res) => {
-  const reports = db.prepare(`
+app.get('/admin', requireAdmin, async (req, res) => {
+  const reports = await db.prepare(`
     SELECT r.*, u.name AS reporter_name,
            (CASE WHEN r.type = 'recipe' THEN (SELECT title FROM recipes WHERE id = r.item_id) ELSE (SELECT body FROM comments WHERE id = r.item_id) END) AS item_label
     FROM reports r
@@ -1392,20 +1432,20 @@ app.get('/admin', requireAdmin, (req, res) => {
   `).all();
 
   const stats = {
-    users: db.prepare('SELECT COUNT(*) AS total FROM users').get().total,
-    recipes: db.prepare('SELECT COUNT(*) AS total FROM recipes').get().total,
-    reports: db.prepare("SELECT COUNT(*) AS total FROM reports WHERE status = 'open'").get().total,
-    comments: db.prepare('SELECT COUNT(*) AS total FROM comments').get().total
+    users: (await db.prepare('SELECT COUNT(*) AS total FROM users').get()).total,
+    recipes: (await db.prepare('SELECT COUNT(*) AS total FROM recipes').get()).total,
+    reports: (await db.prepare("SELECT COUNT(*) AS total FROM reports WHERE status = 'open'").get()).total,
+    comments: (await db.prepare('SELECT COUNT(*) AS total FROM comments').get()).total
   };
 
-  const recipes = db.prepare(`
+  const recipes = await db.prepare(`
     SELECT r.id, r.title, r.category, r.photo_url, r.photo_credit, r.photo_source_url,
            r.photo_license, r.photo_illustrative, r.created_at, u.name AS author_name
     FROM recipes r
     JOIN users u ON u.id = r.user_id
     ORDER BY r.created_at DESC
   `).all();
-  const users = db.prepare(`
+  const users = await db.prepare(`
     SELECT u.id, u.name, u.email, u.is_suspended, u.created_at,
            (SELECT COUNT(*) FROM recipes r WHERE r.user_id = u.id) AS recipes_count
     FROM users u
@@ -1417,41 +1457,41 @@ app.get('/admin', requireAdmin, (req, res) => {
   res.render('admin', { reports, recipes, users, stats, pageTitle: 'Administração' });
 });
 
-app.post('/admin/resolve/:id', requireAdmin, writeLimiter, (req, res) => {
-  db.prepare('UPDATE reports SET status = ? WHERE id = ?').run('resolved', req.params.id);
+app.post('/admin/resolve/:id', requireAdmin, writeLimiter, async (req, res) => {
+  await db.prepare('UPDATE reports SET status = ? WHERE id = ?').run('resolved', req.params.id);
   setFlash(req, 'Denúncia resolvida.', 'success');
   res.redirect('/admin');
 });
 
-app.post('/admin/comment/:id/delete', requireAdmin, writeLimiter, (req, res) => {
-  const comment = db.prepare('SELECT id FROM comments WHERE id = ?').get(req.params.id);
+app.post('/admin/comment/:id/delete', requireAdmin, writeLimiter, async (req, res) => {
+  const comment = await db.prepare('SELECT id FROM comments WHERE id = ?').get(req.params.id);
   if (comment) {
-    db.transaction(() => {
-      db.prepare("DELETE FROM reports WHERE type = 'comment' AND item_id IN (SELECT id FROM comments WHERE id = ? OR parent_id = ?)").run(comment.id, comment.id);
-      db.prepare('DELETE FROM comments WHERE parent_id = ?').run(comment.id);
-      db.prepare('DELETE FROM comments WHERE id = ?').run(comment.id);
+    await db.transaction(async () => {
+      await db.prepare("DELETE FROM reports WHERE type = 'comment' AND item_id IN (SELECT id FROM comments WHERE id = ? OR parent_id = ?)").run(comment.id, comment.id);
+      await db.prepare('DELETE FROM comments WHERE parent_id = ?').run(comment.id);
+      await db.prepare('DELETE FROM comments WHERE id = ?').run(comment.id);
     })();
   }
   setFlash(req, 'Comentário removido pela moderação.', 'success');
   res.redirect('/admin');
 });
 
-app.post('/admin/user/:id/toggle-suspension', requireAdmin, writeLimiter, (req, res) => {
-  const target = db.prepare('SELECT id, is_admin, is_suspended FROM users WHERE id = ?').get(req.params.id);
+app.post('/admin/user/:id/toggle-suspension', requireAdmin, writeLimiter, async (req, res) => {
+  const target = await db.prepare('SELECT id, is_admin, is_suspended FROM users WHERE id = ?').get(req.params.id);
   if (!target || target.is_admin || target.id === req.session.user.id) {
     setFlash(req, 'Essa conta não pode ser moderada por esta ação.', 'warning');
     return res.redirect('/admin');
   }
 
   const nextSuspendedState = target.is_suspended ? 0 : 1;
-  db.prepare('UPDATE users SET is_suspended = ? WHERE id = ?').run(nextSuspendedState, target.id);
-  if (nextSuspendedState) sessionStore.deleteUserSessions.run(target.id);
+  await db.prepare('UPDATE users SET is_suspended = ? WHERE id = ?').run(nextSuspendedState, target.id);
+  if (nextSuspendedState) await sessionStore.deleteUserSessions.run(target.id);
   setFlash(req, nextSuspendedState ? 'Conta suspensa.' : 'Conta reativada.', 'success');
   res.redirect('/admin');
 });
 
-app.post('/admin/recipe/:id/delete', requireAdmin, writeLimiter, (req, res) => {
-  removeRecipe(req.params.id);
+app.post('/admin/recipe/:id/delete', requireAdmin, writeLimiter, async (req, res) => {
+  await removeRecipe(req.params.id);
   setFlash(req, 'Receita removida pela moderação.', 'success');
   res.redirect('/admin');
 });
@@ -1502,7 +1542,17 @@ app.use((req, res) => {
   res.status(404).render('not-found', { pageTitle: 'Página não encontrada' });
 });
 
-app.listen(PORT, HOST, () => {
+async function startServer() {
+  await prepareDatabase();
   const displayHost = HOST.includes(':') && !HOST.startsWith('[') ? `[${HOST}]` : HOST;
-  console.log(`Receitas de Todos rodando em http://${displayHost}:${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`Receitas de Todos rodando em http://${displayHost}:${PORT}`);
+  });
+}
+
+startServer().catch(async (error) => {
+  clearInterval(cleanupSessions);
+  console.error('Não foi possível iniciar o servidor.', error);
+  await db.close();
+  process.exitCode = 1;
 });

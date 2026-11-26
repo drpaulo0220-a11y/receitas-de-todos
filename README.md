@@ -7,15 +7,17 @@ Uma comunidade de culinária para publicar receitas, comentar, avaliar, salvar f
 - Node.js
 - Express
 - EJS
-- SQLite
+- PostgreSQL em produção (Supabase)
+- SQLite no desenvolvimento local e nos testes
 - Better-SQLite3
+- Supabase Storage para imagens em produção
 - bcryptjs
 - express-session
 - multer
 
 ## Requisitos
 
-- Node.js 18+
+- Node.js 20+
 - npm
 
 ## Instalação
@@ -29,17 +31,19 @@ Acesse: http://127.0.0.1:3000
 
 ## Testes
 
-Execute `npm test` para verificar a sintaxe do app e rodar os testes integrados de cadastro, receitas, upload, comentários, moderação e persistência de sessão.
+Execute `npm test` para verificar a sintaxe do app e rodar os testes integrados de cadastro, receitas, upload, comentários, moderação, armazenamento de imagens e persistência de sessão.
+
+Para testar também o PostgreSQL, defina `TEST_DATABASE_URL` para um banco descartável cujo nome termine em `_test` e rode `npm test`. O teste apaga e recria o schema `public` desse banco; nunca use a URL de produção.
 
 ## Conta administradora local
 
-Na primeira inicialização, o servidor cria a conta `admin@receitasdetodos.com` com uma senha aleatória e mostra essa senha no terminal. Guarde-a. Para definir uma senha própria, configure `ADMIN_PASSWORD`; esse valor atualiza a senha do administrador a cada inicialização. Em produção, configure também `ADMIN_EMAIL`, `SESSION_SECRET`, `DATA_DIR` e `UPLOAD_DIR`.
+Na primeira inicialização local, o servidor cria a conta `receitaadmin@sdetodos.com` com uma senha aleatória e mostra essa senha no terminal. Guarde-a. Para definir uma senha própria, configure `ADMIN_PASSWORD`. Em produção, configure `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `DATABASE_URL`, `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY`, conforme a seção de publicação.
 
 ## Funcionalidades implementadas
 
 - Home com receitas recentes, populares e em destaque
 - Cadastro e login com autenticação real em servidor
-- Sessões persistidas no SQLite
+- Sessões persistidas no PostgreSQL em produção e SQLite localmente
 - Publicação, edição e exclusão de receitas
 - Curtidas, favoritos e avaliações por estrelas
 - Comentários com respostas e denúncias de receitas/comentários
@@ -55,26 +59,32 @@ Na primeira inicialização, o servidor cria a conta `admin@receitasdetodos.com`
 
 ## Banco de dados e arquivos
 
-O projeto usa SQLite para armazenar usuários, receitas, comentários, curtidas, avaliações, favoritos, denúncias e sessões.
-Por padrão, o banco fica em `data/recipes.db`. Os uploads ficam em `public/uploads`.
-Use `DATA_DIR` e `UPLOAD_DIR` para apontar para um volume persistente no ambiente de hospedagem.
+Sem `DATABASE_URL`, o app usa SQLite em `data/recipes.db`, adequado para desenvolvimento e testes. Com `DATABASE_URL`, usa PostgreSQL para usuários, receitas, comentários, curtidas, avaliações, favoritos, denúncias e sessões.
+
+Uploads locais ficam em `public/uploads`. Quando `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` estão configuradas, os uploads são enviados para o bucket público do Supabase Storage. Em produção, o app exige PostgreSQL e Supabase Storage para que os dados e imagens sobrevivam a reinicializações da hospedagem.
+As tabelas PostgreSQL têm Row Level Security ativado; o acesso ao banco é feito apenas pelo servidor, usando a conexão privada configurada no ambiente.
 
 ## Preparar para publicação
 
-O app pode ser hospedado em um serviço que rode Node.js. Antes de publicar, configure estas variáveis no provedor:
+O arquivo `render.yaml` prepara um serviço web gratuito no Render. O banco e as imagens ficam no Supabase, evitando depender do disco temporário do serviço web. Para configurar:
+
+1. Crie um projeto Supabase e use o plano gratuito. No painel, copie a URL de conexão PostgreSQL do **Session Pooler** e o Project URL e `service_role` key da API.
+2. No Supabase Storage, crie um bucket público chamado `recipe-images`. A chave `service_role` é secreta e deve ficar somente nas variáveis do servidor.
+3. No Render, crie um Blueprint conectado a este repositório e selecione o `render.yaml`. Preencha as variáveis marcadas como `sync: false`:
 
 ```text
-NODE_ENV=production
-SESSION_SECRET=<segredo longo e aleatório>
+DATABASE_URL=<URL PostgreSQL do Session Pooler do Supabase>
+SUPABASE_URL=<Project URL do Supabase>
+SUPABASE_SERVICE_ROLE_KEY=<chave service_role do Supabase>
 ADMIN_EMAIL=<seu e-mail administrativo>
 ADMIN_PASSWORD=<senha forte>
-DATA_DIR=<caminho do volume persistente para o SQLite>
-UPLOAD_DIR=<caminho do volume persistente para as imagens>
 ```
 
-`SESSION_SECRET` deve ter ao menos 32 caracteres e `ADMIN_PASSWORD` entre 12 e 72 bytes. O comando de inicialização é `npm start`. Em desenvolvimento, o servidor escuta apenas em `127.0.0.1`; para expor na rede, configure `HOST`, `SESSION_SECRET` forte e `ADMIN_PASSWORD` forte. Em produção, `DATA_DIR` e `UPLOAD_DIR` são obrigatórios: aponte ambos para armazenamento persistente do provedor. Um exemplo de montagem é `DATA_DIR=/var/data` e `UPLOAD_DIR=/var/data/uploads`. Serviços com disco temporário podem apagar banco e imagens após reinicializações; não publique com armazenamento efêmero.
+O Blueprint define `NODE_ENV=production`, gera `SESSION_SECRET` e configura o bucket `recipe-images`. `ADMIN_PASSWORD` deve ter entre 12 e 72 bytes; `SESSION_SECRET` deve ter pelo menos 32 caracteres. Use uma senha administrativa nova e exclusiva. Nunca salve essas chaves no repositório nem as envie em mensagens.
 
-O banco SQLite, as sessoes e as imagens podem ficar em armazenamento persistente. Para varias instancias, migre para PostgreSQL e armazenamento de objetos.
+Na primeira inicialização, o servidor cria o esquema PostgreSQL e carrega o catálogo inicial. O SQLite local não é copiado automaticamente para o Supabase; se já houver dados importantes em `data/recipes.db`, faça a migração/exportação antes de publicar. A rota `/health` verifica a conexão com o banco e é usada pelo Render.
+
+Os planos gratuitos têm limites de uso e disponibilidade; o Supabase pode pausar projetos inativos. Confira os limites atuais dos provedores antes de anunciar o site como serviço sempre disponível.
 
 Para instalar no celular, publique o site com HTTPS e use “Adicionar à tela inicial” no navegador. O service worker mantém os recursos estáticos disponíveis em cache; as páginas e dados do usuário precisam de conexão.
 
@@ -82,8 +92,7 @@ As credenciais administrativas por variável de ambiente são aplicadas quando o
 
 ## O que ainda pode ser aprimorado
 
-- Upload de imagens para storage externo (Cloudinary ou Supabase Storage)
-- Migração do SQLite local para banco gerenciado em produção
+- Migração assistida de dados existentes do SQLite local para PostgreSQL
 - Cache e SEO mais robustos
 - Dashboard analítico para moderadores
 - Integração com Google AdSense e analytics
